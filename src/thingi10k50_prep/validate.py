@@ -10,7 +10,9 @@ import scipy.sparse as sp
 
 from mlr.datasets import load_reconstruction_input
 from mlr.io import load_mesh
-from mlr.laplacian import build_uniform_laplacian as mlr_build_uniform_laplacian
+from mlr.coarse_lap_oracle import apply_uniform_laplacian, build_uniform_laplacian_data
+from mlr.learned_laplacian.dataset import load_prepared_sample
+from mlr.learned_laplacian.multi_dataset import PreparedMeshDataset, validate_disjoint_splits
 
 from .io_utils import write_csv
 
@@ -37,6 +39,8 @@ def _check_mesh(vertices: np.ndarray, faces: np.ndarray) -> list[str]:
     area = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1) * 0.5
     if np.any(area <= 0):
         issues.append("non_positive_triangle_area")
+    if len(np.unique(faces)) != len(vertices):
+        issues.append("unreferenced_vertices")
     return issues
 
 
@@ -82,7 +86,7 @@ def validate_dataset(data_root: str | Path) -> None:
                 issues.append("non_finite_projection_distance")
             if not np.isfinite(target_positions).all():
                 issues.append("non_finite_target_positions")
-            if np.any(closest_faces < 0) or np.any(closest_faces >= len(gt_v)):
+            if np.any(closest_faces < 0) or np.any(closest_faces >= len(gt_f)):
                 issues.append("invalid_closest_face_indices")
             if np.any(np.abs(bary.sum(axis=1) - 1.0) > 1e-5):
                 issues.append("barycentric_sum_mismatch")
@@ -90,8 +94,17 @@ def validate_dataset(data_root: str | Path) -> None:
                 issues.append("non_finite_barycentric_coordinates")
             if valid_mask.shape != (len(exp_v),):
                 issues.append("valid_mask_shape_mismatch")
-            if not np.all(valid_mask[valid_mask.astype(bool)]):
+            if valid_mask.dtype.kind not in "bu" or not np.all(np.isin(valid_mask, [0, 1])):
                 issues.append("invalid_valid_mask")
+            expected_valid = (
+                np.isfinite(target_positions).all(axis=1)
+                & np.isfinite(distances)
+                & (closest_faces >= 0)
+                & (closest_faces < len(gt_f))
+                & np.isfinite(bary).all(axis=1)
+            )
+            if not np.array_equal(valid_mask.astype(bool), expected_valid) or not np.all(expected_valid):
+                issues.append("valid_mask_semantics_mismatch")
             if not np.isfinite(lap.data).all():
                 issues.append("non_finite_laplacian")
 
@@ -100,7 +113,8 @@ def validate_dataset(data_root: str | Path) -> None:
                 issues.append("missing_views_dataset_json")
             else:
                 dataset = load_reconstruction_input(dataset_json)
-                if len(dataset.image_paths) != 40:
+                expected_views = int(manifest.loc[manifest["file_id"] == file_id, "views_count"].iloc[0])
+                if len(dataset.image_paths) != expected_views:
                     issues.append("unexpected_view_count")
                 if not (model_dir / "views" / "cameras.json").exists():
                     issues.append("missing_cameras_json")
@@ -113,12 +127,25 @@ def validate_dataset(data_root: str | Path) -> None:
                 except Exception as exc:  # noqa: BLE001
                     issues.append(f"load_mesh_failed:{mesh_name}:{exc}")
 
-            expected_lap = mlr_build_uniform_laplacian(len(exp_v), exp_f)
-            if not np.allclose(lap.toarray(), expected_lap, rtol=0.0, atol=1e-12):
+            downstream_data = build_uniform_laplacian_data(exp_f, len(exp_v))
+            probes = np.random.default_rng(1949 + file_id).standard_normal((len(exp_v), 3))
+            if not np.allclose(lap @ probes, apply_uniform_laplacian(probes, downstream_data), rtol=0.0, atol=1e-12):
                 issues.append("laplacian_contract_mismatch")
-            expected_delta = expected_lap @ target_positions
-            if not np.allclose(delta, expected_delta, rtol=0.0, atol=1e-12):
+            expected_delta = apply_uniform_laplacian(target_positions, downstream_data)
+            if not np.allclose(delta, expected_delta, rtol=0.0, atol=2e-7):
                 issues.append("laplacian_target_contract_mismatch")
+
+            prepared = load_prepared_sample(root / "prepared" / f"thingi10k_{file_id}.pt")
+            required_extra = (
+                "raw_laplacian_target", "normalized_laplacian_target", "valid_scale_mask",
+                "local_edge_length", "local_edge_scale", "target_positions", "gt_vertices", "gt_faces",
+            )
+            if any(name not in prepared for name in required_extra):
+                issues.append("prepared_sample_missing_extended_fields")
+            if prepared["sample_id"] != f"thingi10k_{file_id}":
+                issues.append("prepared_sample_id_mismatch")
+            if not np.allclose(prepared["raw_laplacian_target"].numpy(), delta, atol=2e-7, rtol=0.0):
+                issues.append("prepared_raw_target_mismatch")
         except Exception as exc:  # noqa: BLE001
             issues.append(f"validation_exception:{exc}")
 
@@ -138,9 +165,14 @@ def validate_dataset(data_root: str | Path) -> None:
     split = json.loads((root / "split.json").read_text(encoding="utf-8"))
     if len(manifest) != 50:
         raise RuntimeError(f"Expected 50 manifest rows, found {len(manifest)}")
-    if len(split["train"]) != 40 or len(split["val"]) != 5 or len(split["test"]) != 5:
+    if len(split["train"]) != 40 or len(split["validation"]) != 5 or len(split["test"]) != 5:
         raise RuntimeError("Split counts do not match 40/5/5")
+
+    prepared_manifest = root / "prepared_manifest.json"
+    datasets = [PreparedMeshDataset.from_manifest(prepared_manifest, name) for name in ("train", "validation", "test")]
+    validate_disjoint_splits(*datasets)
+    if [len(dataset) for dataset in datasets] != [40, 5, 5]:
+        raise RuntimeError("Prepared manifest split counts do not match 40/5/5")
 
     report = {"total_models": len(rows), "valid_models": len(rows), "invalid_models": 0}
     (root / "reports" / "validation_summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-

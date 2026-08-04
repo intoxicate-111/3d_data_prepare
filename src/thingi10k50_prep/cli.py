@@ -27,7 +27,11 @@ def prepare_main() -> None:
 def validate_main() -> None:
     parser = argparse.ArgumentParser(description="Validate prepared Thingi10K50 dataset")
     parser.add_argument("--data-root", default="data/thingi10k50")
+    parser.add_argument("--config", default="configs/thingi10k50.yaml")
     args = parser.parse_args()
+    from .downstream import validate_downstream
+
+    validate_downstream(load_config(args.config).downstream)
     from .validate import validate_dataset
 
     validate_dataset(args.data_root)
@@ -36,7 +40,11 @@ def validate_main() -> None:
 def smoke_main() -> None:
     parser = argparse.ArgumentParser(description="Run data smoke test on prepared Thingi10k50")
     parser.add_argument("--data-root", default="data/thingi10k50")
+    parser.add_argument("--config", default="configs/thingi10k50.yaml")
     args = parser.parse_args()
+    from .downstream import validate_downstream
+
+    validate_downstream(load_config(args.config).downstream)
     from .smoke import run_smoke_test
 
     run_smoke_test(args.data_root)

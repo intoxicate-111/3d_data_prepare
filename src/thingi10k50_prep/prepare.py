@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 import random
+import subprocess
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -12,15 +13,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scipy.sparse as sp
 import thingi10k
+import torch
 import trimesh
 from tqdm import tqdm
 
-from mlr.datasets import load_reconstruction_input
-from mlr.io import load_mesh, save_mesh
-from mlr.laplacian import build_uniform_laplacian as mlr_build_uniform_laplacian
-from mlr.synthetic import SyntheticRenderConfig, generate_synthetic_dataset
-
 from .config import PrepareConfig
+from .downstream import DownstreamRuntime, validate_downstream
 from .io_utils import ensure_dir, save_mesh_npz, setup_logger, write_csv, write_json
 from .mesh_ops import (
     build_uniform_laplacian,
@@ -69,6 +67,63 @@ def _save_obj(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
     path.write_text(mesh.export(file_type="obj"), encoding="utf-8")
 
 
+def _build_prepared_sample(
+    dataset_json: Path,
+    expanded_obj: Path,
+    gt_obj: Path,
+    targets: dict[str, np.ndarray],
+    laplacian: sp.csr_matrix,
+    image_size: int,
+    sample_id: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble existing projections through the downstream loader/scaling contract."""
+    from mlr.datasets import load_masks, load_reconstruction_input
+    from mlr.io import load_mesh
+    from mlr.learned_laplacian.dataset import validate_sample
+    from mlr.learned_laplacian.sample_io import _load_images, _mask_visibility
+
+    reconstruction = load_reconstruction_input(dataset_json)
+    prediction_mesh = load_mesh(expanded_obj).ensure_normals()
+    gt_mesh = load_mesh(gt_obj).ensure_normals()
+    images, scale_xy = _load_images(reconstruction.image_paths, image_size)
+    intrinsics: list[np.ndarray] = []
+    extrinsics: list[np.ndarray] = []
+    for camera in reconstruction.cameras:
+        scaled = camera.intrinsics.copy()
+        scaled[0, :] *= scale_xy[0]
+        scaled[1, :] *= scale_xy[1]
+        intrinsics.append(scaled)
+        extrinsic = np.eye(4, dtype=np.float64)
+        extrinsic[:3, :3] = camera.rotation
+        extrinsic[:3, 3] = camera.translation
+        extrinsics.append(extrinsic)
+    masks = load_masks(reconstruction.mask_paths)
+    visibility = None
+    if masks is not None:
+        visibility = _mask_visibility(prediction_mesh.vertices, reconstruction.cameras, masks, scale_xy)
+    raw_target = laplacian @ targets["target_positions"]
+    sample = {
+        "sample_id": sample_id,
+        "images": images,
+        "intrinsics": torch.as_tensor(np.stack(intrinsics), dtype=torch.float32),
+        "extrinsics": torch.as_tensor(np.stack(extrinsics), dtype=torch.float32),
+        "vertices": torch.as_tensor(prediction_mesh.vertices, dtype=torch.float32),
+        "faces": torch.as_tensor(prediction_mesh.faces, dtype=torch.long),
+        "vertex_normals": torch.as_tensor(prediction_mesh.normals, dtype=torch.float32),
+        "initial_laplacian": torch.as_tensor(laplacian @ prediction_mesh.vertices, dtype=torch.float32),
+        "laplacian_target": torch.as_tensor(raw_target, dtype=torch.float32),
+        "raw_laplacian_target": torch.as_tensor(raw_target, dtype=torch.float32),
+        "target_confidence": torch.as_tensor(targets["valid_mask"], dtype=torch.float32),
+        "visibility": None if visibility is None else torch.as_tensor(visibility, dtype=torch.bool),
+        "target_positions": torch.as_tensor(targets["target_positions"], dtype=torch.float32),
+        "gt_vertices": torch.as_tensor(gt_mesh.vertices, dtype=torch.float32),
+        "gt_faces": torch.as_tensor(gt_mesh.faces, dtype=torch.long),
+        "metadata": metadata,
+    }
+    return validate_sample(sample)
+
+
 def _preview(path: Path, gt_v: np.ndarray, coarse_v: np.ndarray, expanded_v: np.ndarray) -> None:
     fig = plt.figure(figsize=(9, 3))
     axes = [fig.add_subplot(1, 3, i + 1, projection="3d") for i in range(3)]
@@ -87,19 +142,24 @@ def _preview(path: Path, gt_v: np.ndarray, coarse_v: np.ndarray, expanded_v: np.
     plt.close(fig)
 
 
-def _write_contract_report(root: Path) -> None:
+def _write_contract_report(root: Path, runtime: DownstreamRuntime) -> None:
     reports = root / "reports"
     ensure_dir(reports)
     contract = reports / "existing_pipeline_contract.md"
 
-    mlr_repo_root = "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/multiview-laplacian-refinement"
-    mlr_branch = "main"
-    mlr_commit = "b1ab020f4e7d73f1345da58e9d1e6547e20b38c0"
+    try:
+        data_prep_sha = subprocess.check_output(
+            ["git", "-C", str(Path(__file__).resolve().parents[2]), "rev-parse", "HEAD"], text=True
+        ).strip()
+    except Exception:  # noqa: BLE001
+        data_prep_sha = "unknown"
     payload = (
         "# Existing pipeline contract\n\n"
-        f"- Repository root: `{mlr_repo_root}`\n"
-        f"- Active branch: `{mlr_branch}`\n"
-        f"- Active commit: `{mlr_commit}`\n"
+        f"- Repository URL: `{runtime.url}`\n"
+        f"- Repository root: `{runtime.root}`\n"
+        f"- Active branch: `{runtime.branch}`\n"
+        f"- Active commit: `{runtime.sha}`\n"
+        f"- Data-preparation commit: `{data_prep_sha}`\n"
         "- Entry point: `mlr.cli:main` via `mlr` console script\n"
         "- Directory structure expected by this project: `views/images`, `views/masks`, `views/depth`, `views/cameras.json`, `views/dataset.json`, `views/mesh.obj`\n"
         "- Normalization convention: AABB-center + longest-side-to-2.0, with renderer `normalize_mesh=False` for already normalized meshes\n"
@@ -108,7 +168,7 @@ def _write_contract_report(root: Path) -> None:
         "- Laplacian type: downstream uniform operator `I - D^-1 A`\n"
         "- Target quantity: `delta_target = L_exp @ target_positions`\n"
         "- Multi-view inputs: downstream-compatible synthetic renderer from `mlr.synthetic`\n"
-        "- Train/val/test expectations: split JSON/CSV with 40/5/5 IDs\n"
+        "- Train/validation/test expectations: prepared manifest with 40/5/5 disjoint samples\n"
     )
     contract.write_text(payload, encoding="utf-8")
 
@@ -193,15 +253,39 @@ def _make_split(selected: list[dict[str, Any]], cfg: PrepareConfig) -> dict[str,
     train = [int(x["file_id"]) for x in shuffled[: cfg.split.train]]
     val = [int(x["file_id"]) for x in shuffled[cfg.split.train : cfg.split.train + cfg.split.val]]
     test = [int(x["file_id"]) for x in shuffled[cfg.split.train + cfg.split.val :]]
-    return {"train": train, "val": val, "test": test}
+    return {"train": train, "validation": val, "test": test}
+
+
+def _replacement_candidate(
+    failed: dict[str, Any], valid_rows: list[dict[str, Any]], selected_ids: set[int],
+    used_thing_ids: set[int], current_scan_index: int,
+) -> dict[str, Any] | None:
+    """Pick a deterministic later candidate, preferring the failed slot's stratum."""
+    eligible = [
+        row for row in valid_rows
+        if int(row["file_id"]) not in selected_ids
+        and int(row.get("scan_index", -1)) > current_scan_index
+        and (int(row.get("thing_id", -1)) <= 0 or int(row["thing_id"]) not in used_thing_ids)
+    ]
+    preferred = [row for row in eligible if row["stratum"] == failed["stratum"]]
+    pool = preferred or eligible
+    if not pool:
+        return None
+    return min(pool, key=lambda row: (int(row["scan_index"]), int(row["file_id"])))
 
 
 def prepare_dataset(cfg: PrepareConfig) -> None:
+    runtime = validate_downstream(cfg.downstream)
+    from mlr.datasets import load_reconstruction_input
+    from mlr.io import load_mesh
+    from mlr.learned_laplacian.dataset import save_prepared_sample, validate_sample
+    from mlr.synthetic import SyntheticRenderConfig, generate_synthetic_dataset
+
     output_root = Path(cfg.output_root)
     ensure_dir(output_root)
     logger = setup_logger(output_root / cfg.log_file)
     logger.info("Starting Thingi10K50 preparation")
-    _write_contract_report(output_root)
+    _write_contract_report(output_root, runtime)
 
     thingi10k.init(variant="npz", cache_dir=cfg.cache_dir)
     dataset_fn = thingi10k.dataset
@@ -213,7 +297,8 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
     failed_rows: list[dict[str, Any]] = []
 
     logger.info("Scanning candidates from thingi10k.dataset()")
-    for entry in tqdm(list(thingi10k.dataset()), desc="Scanning candidates"):
+    dataset_entries = list(thingi10k.dataset())
+    for scan_index, entry in enumerate(tqdm(dataset_entries, desc="Scanning candidates")):
         file_id = _entry_int(entry, ("file_id", "id", "model_id"))
         thing_id = _entry_int(entry, ("thing_id", "thing"))
         if file_id in cfg.known_corrupt_ids:
@@ -240,6 +325,7 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                     if trimesh.Trimesh(vertices=arrays.vertices, faces=arrays.faces, process=False).is_watertight
                     else "open",
                     "stratum": _stratum_for_face_count(int(len(arrays.faces)), [asdict(s) for s in cfg.strata]),
+                    "scan_index": scan_index,
                 }
             )
         except Exception as exc:  # noqa: BLE001
@@ -256,13 +342,17 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
     write_csv(output_root / "split.csv", split_csv)
 
     manifest_rows: list[dict[str, Any]] = []
+    prepared_records: list[dict[str, Any]] = []
     model_root = output_root / "models"
+    prepared_root = output_root / cfg.prepared_samples.directory
     ensure_dir(model_root)
+    ensure_dir(prepared_root)
 
     id_to_split = {fid: s for s, ids in split.items() for fid in ids}
     selected_by_id = {int(row["file_id"]): row for row in selected}
     logger.info("Processing selected models")
-    for entry in tqdm(list(thingi10k.dataset()), desc="Preparing models"):
+    used_thing_ids = {int(row["thing_id"]) for row in selected if int(row.get("thing_id", -1)) > 0}
+    for scan_index, entry in enumerate(tqdm(dataset_entries, desc="Preparing models")):
         file_id = _entry_int(entry, ("file_id", "id", "model_id"))
         if file_id not in selected_by_id:
             continue
@@ -280,11 +370,18 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                     output_issues.extend(_check_mesh(mesh_v, mesh_f))
 
                 views_dataset = out_dir / "views" / "dataset.json"
+                prepared_path = prepared_root / f"thingi10k_{file_id}.pt"
                 if not views_dataset.exists():
                     output_issues.append("missing_views_dataset")
+                if not prepared_path.exists():
+                    output_issues.append("missing_prepared_sample")
                 if not output_issues:
                     logger.info("Skipping already valid model %s", file_id)
                     manifest_rows.append(metrics["manifest_row"])
+                    prepared_records.append(
+                        {"path": str(prepared_path.relative_to(output_root)), "split": id_to_split[file_id],
+                         "sample_id": f"thingi10k_{file_id}"}
+                    )
                     continue
                 logger.info("Regenerating invalid cached model %s: %s", file_id, sorted(set(output_issues)))
 
@@ -343,7 +440,7 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 normalize_mesh=False,
             )
             rendered = generate_synthetic_dataset(
-                mesh=trimesh.Trimesh(vertices=gt_norm_v.astype(np.float64), faces=gt_f.astype(np.int64), process=False),
+                mesh=load_mesh(out_dir / "gt_mesh.obj"),
                 out_dir=views_dir,
                 config=render_cfg,
                 source_mesh_path=out_dir / "gt_mesh.obj",
@@ -361,6 +458,34 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 ensure_dir(views_dir / rel_path)
 
             write_json(out_dir / "views_dataset.json", {"path": str(dataset_json), "views": len(dataset.image_paths)})
+
+            prepared = _build_prepared_sample(
+                dataset_json, out_dir / "expanded_mesh.obj", out_dir / "gt_mesh.obj",
+                targets, lap, cfg.prepared_samples.image_size, f"thingi10k_{file_id}",
+                {
+                    "dataset_path": str(dataset_json),
+                    "coarse_mesh_path": str(out_dir / "expanded_mesh.obj"),
+                    "gt_mesh_path": str(out_dir / "gt_mesh.obj"),
+                    "operator_type": "uniform",
+                    "target_constructor": "precomputed_closest_surface_on_prediction_graph",
+                    "laplacian_target_mode": cfg.prepared_samples.target_mode,
+                    "edge_scale_epsilon": cfg.prepared_samples.edge_scale_epsilon,
+                    "file_id": int(file_id),
+                    "split": id_to_split[file_id],
+                    "normalization": norm,
+                    "downstream_url": runtime.url,
+                    "downstream_branch": runtime.branch,
+                    "downstream_sha": runtime.sha,
+                },
+            )
+            prepared_path = prepared_root / f"thingi10k_{file_id}.pt"
+            save_prepared_sample(prepared, prepared_path)
+            raw_target = prepared["raw_laplacian_target"].detach().cpu().numpy()
+            np.savez_compressed(out_dir / "laplacian_targets.npz", laplacian_target=raw_target.astype(np.float32))
+            prepared_records.append(
+                {"path": str(prepared_path.relative_to(output_root)), "split": id_to_split[file_id],
+                 "sample_id": prepared["sample_id"]}
+            )
 
             dist = targets["surface_distance"]
             manifest_row = {
@@ -408,6 +533,25 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
             manifest_rows.append(manifest_row)
         except Exception as exc:  # noqa: BLE001
             failed_rows.append({"file_id": file_id, "reason": f"processing_failure: {exc}"})
+            failed_row = selected_by_id[file_id]
+            replacement = _replacement_candidate(
+                failed_row, valid_rows, set(selected_by_id), used_thing_ids, scan_index
+            )
+            if replacement is not None:
+                failed_split = id_to_split.pop(file_id)
+                split[failed_split].remove(file_id)
+                replacement_id = int(replacement["file_id"])
+                split[failed_split].append(replacement_id)
+                id_to_split[replacement_id] = failed_split
+                selected_by_id[replacement_id] = replacement
+                replacement_thing = int(replacement.get("thing_id", -1))
+                if replacement_thing > 0:
+                    used_thing_ids.add(replacement_thing)
+                logger.warning(
+                    "Replacing failed model %s with %s in split %s", file_id, replacement_id, failed_split
+                )
+            else:
+                logger.error("No eligible later replacement for failed model %s", file_id)
             write_csv(output_root / "failed_models.csv", failed_rows)
 
     if len(manifest_rows) != 50:
@@ -415,7 +559,14 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
 
     write_csv(output_root / "manifest.csv", manifest_rows)
     write_json(output_root / "manifest.json", manifest_rows)
+    write_json(
+        output_root / cfg.prepared_samples.manifest,
+        {"samples": prepared_records, "downstream": {**asdict(runtime), "root": str(runtime.root)}},
+    )
     write_csv(output_root / "failed_models.csv", failed_rows)
+    split_csv = [{"file_id": file_id, "split": name} for name, ids in split.items() for file_id in ids]
+    write_json(output_root / "split.json", split)
+    write_csv(output_root / "split.csv", split_csv)
     write_json(output_root / "config.yaml.resolved.json", asdict(cfg))
     _write_preparation_report(output_root, manifest_rows, valid_rows, rejected_rows, failed_rows, cfg)
 

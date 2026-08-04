@@ -12,6 +12,7 @@ from thingi10k50_prep.mesh_ops import build_uniform_laplacian
         (np.array([[0, 1, 2]], dtype=np.int64), 3),
         (np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64), 4),
         (np.array([[0, 1, 2], [2, 3, 4], [4, 5, 6]], dtype=np.int64), 7),
+        (np.array([[0, 1, 2]], dtype=np.int64), 4),
     ],
 )
 def test_sparse_uniform_laplacian_matches_mlr(faces: np.ndarray, num_vertices: int) -> None:
@@ -21,3 +22,5 @@ def test_sparse_uniform_laplacian_matches_mlr(faces: np.ndarray, num_vertices: i
     expected = mlr_build_uniform_laplacian(faces, num_vertices)
 
     np.testing.assert_allclose(our_laplacian.toarray(), expected, rtol=0.0, atol=1e-12)
+    if num_vertices == 4 and faces.shape[0] == 1:
+        np.testing.assert_array_equal(our_laplacian.getrow(3).toarray(), np.zeros((1, 4)))

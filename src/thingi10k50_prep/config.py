@@ -23,6 +23,22 @@ class SplitConfig:
 
 
 @dataclass(frozen=True)
+class DownstreamConfig:
+    repo_url: str
+    repo_root: str
+    branch: str
+
+
+@dataclass(frozen=True)
+class PreparedSampleConfig:
+    directory: str
+    manifest: str
+    image_size: int
+    target_mode: str
+    edge_scale_epsilon: float
+
+
+@dataclass(frozen=True)
 class PrepareConfig:
     seed: int
     cache_dir: str
@@ -42,6 +58,8 @@ class PrepareConfig:
     views_count: int
     views_width: int
     views_height: int
+    downstream: DownstreamConfig
+    prepared_samples: PreparedSampleConfig
 
 
 def load_config(path: str | Path) -> PrepareConfig:
@@ -51,6 +69,8 @@ def load_config(path: str | Path) -> PrepareConfig:
 
     strata = [StratumConfig(**item) for item in raw["strata"]]
     split = SplitConfig(**raw["split"])
+    downstream = DownstreamConfig(**raw["downstream"])
+    prepared_samples = PreparedSampleConfig(**raw["prepared_samples"])
     return PrepareConfig(
         seed=int(raw["seed"]),
         cache_dir=str(raw["cache_dir"]),
@@ -70,5 +90,6 @@ def load_config(path: str | Path) -> PrepareConfig:
         views_count=int(raw["views"]["count"]),
         views_width=int(raw["views"]["width"]),
         views_height=int(raw["views"]["height"]),
+        downstream=downstream,
+        prepared_samples=prepared_samples,
     )
-

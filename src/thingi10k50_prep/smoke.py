@@ -1,83 +1,113 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 import numpy as np
-import scipy.sparse as sp
+import torch
+import torch.nn.functional as functional
 
-from mlr.datasets import load_reconstruction_input
-from mlr.io import load_mesh, save_mesh
-from mlr.laplacian import build_uniform_laplacian as mlr_build_uniform_laplacian
-from mlr.oracle import OracleBaselineConfig, run_oracle_baselines
+from mlr.learned_laplacian.dataset import load_prepared_sample, validate_sample
+from mlr.learned_laplacian.evaluation import reconstruct_and_evaluate
+from mlr.learned_laplacian.multi_dataset import PreparedMeshDataset, validate_disjoint_splits
+from mlr.learned_laplacian.multi_trainer import train_multi_object
+from mlr.learned_laplacian.target_scaling import denormalize_laplacian_by_edge_scale
+from mlr.learned_laplacian.trainer import train_single_object
+
+
+def _small_real_sample(sample: dict, size: int = 64) -> dict:
+    """Keep real geometry/camera data while making the CPU smoke test bounded."""
+    result = dict(sample)
+    old_h, old_w = sample["images"].shape[-2:]
+    result["images"] = functional.interpolate(
+        sample["images"][:1], size=(size, size), mode="bilinear", align_corners=False
+    )
+    result["intrinsics"] = sample["intrinsics"][:1].clone()
+    result["intrinsics"][:, 0, :] *= size / old_w
+    result["intrinsics"][:, 1, :] *= size / old_h
+    result["extrinsics"] = sample["extrinsics"][:1]
+    if sample.get("visibility") is not None:
+        result["visibility"] = sample["visibility"][:1]
+    return validate_sample(result)
+
+
+def _training_config(seed: int) -> dict:
+    return {
+        "seed": seed,
+        "device": "cpu",
+        "input_mode": "coarse_plus_multiview",
+        "target_mode": "edge_scale_normalized_laplacian",
+        "target_scaling": {"method": "square_of_mean_incident_edge_length", "epsilon": 1e-12},
+        "image_encoder": {"feature_dim": 4},
+        "model": {"hidden_dim": 8, "num_graph_layers": 1, "dropout": 0.0},
+        "training": {"steps": 1, "learning_rate": 1e-4, "loss": "huber", "huber_delta": 0.01},
+        "multi_object_training": {
+            "epochs": 1, "gradient_accumulation_meshes": 1,
+            "validation_every_epochs": 1, "shuffle": False,
+        },
+    }
 
 
 def run_smoke_test(data_root: str | Path) -> None:
     root = Path(data_root)
-    split = json.loads((root / "split.json").read_text(encoding="utf-8"))
-    picks = {
-        "train": split["train"][0],
-        "val": split["val"][0],
-        "test": split["test"][0],
+    manifest_path = root / "prepared_manifest.json"
+    datasets = {
+        name: PreparedMeshDataset.from_manifest(manifest_path, name)
+        for name in ("train", "validation", "test")
     }
-
-    mlr_repo_root = Path("/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/multiview-laplacian-refinement")
-    downstream_commit = subprocess.check_output(["git", "-C", str(mlr_repo_root), "rev-parse", "HEAD"], text=True).strip()
-
+    validate_disjoint_splits(*datasets.values())
+    reports = root / "reports" / "learned_smoke"
+    reports.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, object]] = []
-    for split_name, file_id in picks.items():
-        model_dir = root / "models" / str(file_id)
-        expanded = np.load(model_dir / "expanded_mesh.npz")["vertices"]
-        lap = sp.load_npz(model_dir / "laplacian.npz")
-        targets = np.load(model_dir / "targets.npz")["target_positions"]
-        delta = np.load(model_dir / "laplacian_targets.npz")["laplacian_target"]
 
-        pred = lap @ targets
-        l2 = float(np.linalg.norm(pred - delta) / np.sqrt(delta.size))
-
-        dataset_json = model_dir / "views" / "dataset.json"
-        if not dataset_json.exists():
-            raise FileNotFoundError(f"Missing downstream views dataset: {dataset_json}")
-        dataset = load_reconstruction_input(dataset_json)
-        gt_mesh = load_mesh(model_dir / "gt_mesh.obj")
-        coarse_mesh = load_mesh(model_dir / "coarse_mesh.obj")
-        expanded_mesh = load_mesh(model_dir / "expanded_mesh.obj")
-
-        expected_lap = mlr_build_uniform_laplacian(expanded_mesh.faces, len(expanded_mesh.vertices))
-        np.testing.assert_allclose(lap.toarray(), expected_lap, rtol=0.0, atol=1e-12)
-
-        expected_delta = expected_lap @ targets
-        np.testing.assert_allclose(delta, expected_delta, rtol=0.0, atol=1e-12)
-
-        if expanded.shape[0] != lap.shape[0]:
-            raise RuntimeError(f"Shape mismatch for {split_name}/{file_id}")
-
-        oracle = run_oracle_baselines(
-            gt_mesh,
-            gt_mesh.vertices,
-            config=OracleBaselineConfig(operator_type="uniform", num_iters=2, learning_rate=1e-3),
+    for index, split_name in enumerate(("train", "validation", "test")):
+        record = datasets[split_name].records[0]
+        loaded = load_prepared_sample(record.path)
+        sample = _small_real_sample(loaded)
+        trained = train_single_object(
+            sample, _training_config(900 + index), output_dir=reports / split_name,
+            device_override="cpu", progress=False,
         )
-        oracle_result = oracle["position_plus_laplacian"]
-        if not np.isfinite(oracle_result.history[-1]["loss"]):
-            raise RuntimeError(f"Non-finite oracle loss for {split_name}/{file_id}")
-        save_mesh(oracle_result.mesh, root / "reports" / f"smoke_{split_name}_{file_id}.obj")
-
-        if len(dataset.image_paths) != 40:
-            raise RuntimeError(f"Unexpected view count for {split_name}/{file_id}")
-        if coarse_mesh.vertices.shape[0] == 0 or expanded_mesh.vertices.shape[0] == 0:
-            raise RuntimeError(f"Empty coarse/expanded geometry for {split_name}/{file_id}")
-
-        results.append(
-            {
-                "split": split_name,
-                "file_id": int(file_id),
-                "rmse_like": l2,
-                "views": len(dataset.image_paths),
-                "downstream_commit": downstream_commit,
-                "oracle_loss": float(oracle_result.history[-1]["loss"]),
-            }
+        trained.model.eval()
+        with torch.no_grad():
+            normalized = trained.model(sample).predicted_laplacian
+            raw = denormalize_laplacian_by_edge_scale(normalized, sample["local_edge_length"])
+        if not torch.isfinite(raw).all() or not np.isfinite(trained.final_loss):
+            raise FloatingPointError(f"Non-finite learned smoke result for {split_name}")
+        evaluation = reconstruct_and_evaluate(
+            sample, raw, reports / split_name / "reconstruction",
+            {"operator_type": "uniform", "num_iters": 1, "learning_rate": 1e-3,
+             "dense_vertex_limit": 5000, "chamfer_samples": 64, "metric_seed": 77},
+            normalized_prediction=normalized,
         )
+        if not evaluation["reconstruction"]["all_finite"]:
+            raise FloatingPointError(f"Non-finite reconstruction for {split_name}")
+        results.append({
+            "split": split_name, "sample_id": sample["sample_id"],
+            "vertices": int(sample["vertices"].shape[0]), "initial_loss": trained.initial_loss,
+            "final_loss": trained.final_loss, "evaluation": evaluation,
+        })
 
-    (root / "reports" / "smoke_test.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
-
+    train_samples = [_small_real_sample(datasets["train"][i]) for i in range(2)]
+    if train_samples[0]["vertices"].shape[0] == train_samples[1]["vertices"].shape[0]:
+        raise RuntimeError("Multi-mesh smoke requires two variable-topology meshes")
+    validation_samples = [_small_real_sample(datasets["validation"][0])]
+    multi = train_multi_object(
+        train_samples, validation_samples, _training_config(1201),
+        output_dir=reports / "multi_object", device_override="cpu",
+        input_mode_override="coarse_only", zero_images=True, progress=False,
+    )
+    if not np.isfinite(multi.final_train_loss) or not np.isfinite(multi.final_validation_loss):
+        raise FloatingPointError("Non-finite multi-object smoke result")
+    payload = {
+        "single_object": results,
+        "multi_object": {
+            "train_sample_ids": [sample["sample_id"] for sample in train_samples],
+            "validation_sample_ids": [sample["sample_id"] for sample in validation_samples],
+            "vertex_counts": [int(sample["vertices"].shape[0]) for sample in train_samples],
+            "optimizer_steps": multi.optimizer_steps,
+            "final_train_loss": multi.final_train_loss,
+            "final_validation_loss": multi.final_validation_loss,
+        },
+    }
+    (root / "reports" / "smoke_test.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")

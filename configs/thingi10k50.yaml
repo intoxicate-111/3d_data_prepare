@@ -23,6 +23,16 @@ coarse_mesh:
 subdivision:
   steps: 1
 views:
-  count: 40
-  width: 1024
-  height: 1024
+  count: 4
+  width: 64
+  height: 64
+downstream:
+  repo_url: "https://github.com/intoxicate-111/multiview-laplacian-refinement.git"
+  repo_root: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/multiview-laplacian-refinement"
+  branch: "fix/clean-bunny-normalized-laplacian"
+prepared_samples:
+  directory: "prepared"
+  manifest: "prepared_manifest.json"
+  image_size: 64
+  target_mode: "edge_scale_normalized_laplacian"
+  edge_scale_epsilon: 1.0e-12

@@ -4,3 +4,13 @@ __pycache__/
 .pytest_cache/
 .venv/
 .env
+.vscode/
+tmp_*/
+workspace_*/
+debug_render*/
+data/
+sample/
+runs/
+cache/
+*.pt
+*.pth

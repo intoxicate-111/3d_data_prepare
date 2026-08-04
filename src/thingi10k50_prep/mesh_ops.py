@@ -15,6 +15,15 @@ class MeshArrays:
     faces: np.ndarray
 
 
+def remove_unreferenced_vertices(vertices: np.ndarray, faces: np.ndarray) -> tuple[MeshArrays, np.ndarray, np.ndarray]:
+    v = np.asarray(vertices)
+    f = np.asarray(faces, dtype=np.int64)
+    referenced = np.unique(f.reshape(-1))
+    old_to_new = np.full(len(v), -1, dtype=np.int64)
+    old_to_new[referenced] = np.arange(len(referenced), dtype=np.int64)
+    return MeshArrays(v[referenced], old_to_new[f]), old_to_new, referenced
+
+
 def _as_mesh(vertices: np.ndarray, faces: np.ndarray) -> trimesh.Trimesh:
     return trimesh.Trimesh(
         vertices=np.asarray(vertices, dtype=np.float64),
@@ -75,7 +84,10 @@ def mesh_cleanup(vertices: np.ndarray, faces: np.ndarray) -> tuple[MeshArrays, l
 
     mesh = _as_mesh(v, f)
     before = len(mesh.vertices)
+    before = len(mesh.vertices)
     mesh.remove_unreferenced_vertices()
+    if len(mesh.vertices) != before:
+        operations.append("removed_post_merge_unreferenced_vertices")
     if len(mesh.vertices) != before:
         operations.append("removed_unreferenced_vertices")
 
@@ -138,7 +150,8 @@ def normalize_vertices(vertices: np.ndarray) -> tuple[np.ndarray, dict[str, Any]
 def simplify_mesh(vertices: np.ndarray, faces: np.ndarray, target_vertices: int, min_vertices: int) -> MeshArrays:
     mesh = _as_mesh(vertices, faces)
     if len(mesh.vertices) <= target_vertices:
-        return MeshArrays(np.asarray(mesh.vertices), np.asarray(mesh.faces))
+        compact, _, _ = remove_unreferenced_vertices(np.asarray(mesh.vertices), np.asarray(mesh.faces))
+        return compact
 
     target_vertices = max(target_vertices, min_vertices)
     ratio = float(target_vertices) / float(len(mesh.vertices))
@@ -152,7 +165,8 @@ def simplify_mesh(vertices: np.ndarray, faces: np.ndarray, target_vertices: int,
     simplified = mesh.simplify_quadric_decimation(face_count=target_faces)
     if simplified is None or len(simplified.vertices) < min_vertices:
         raise RuntimeError("Simplification failed or produced too few vertices")
-    return MeshArrays(np.asarray(simplified.vertices), np.asarray(simplified.faces))
+    compact, _, _ = remove_unreferenced_vertices(np.asarray(simplified.vertices), np.asarray(simplified.faces))
+    return compact
 
 
 def midpoint_subdivide(vertices: np.ndarray, faces: np.ndarray, steps: int) -> tuple[MeshArrays, dict[str, np.ndarray]]:
@@ -215,7 +229,15 @@ def midpoint_subdivide(vertices: np.ndarray, faces: np.ndarray, steps: int) -> t
         | (f_out[:, 0] == f_out[:, 2])
     )
     f_out = f_out[(area > 0) & ~repeated_idx]
-    return MeshArrays(v_out, f_out), mapping
+    compact, old_to_new, referenced = remove_unreferenced_vertices(v_out, f_out)
+    parents = mapping["parent_edges"]
+    children = mapping["new_vertex_indices"]
+    keep = (old_to_new[children] >= 0) & np.all(old_to_new[parents] >= 0, axis=1)
+    mapping["parent_edges"] = old_to_new[parents[keep]]
+    mapping["new_vertex_indices"] = old_to_new[children[keep]]
+    mapping["pre_compaction_to_final"] = old_to_new
+    mapping["final_to_pre_compaction"] = referenced
+    return compact, mapping
 
 
 def compute_surface_targets(
@@ -271,5 +293,6 @@ def build_uniform_laplacian(num_vertices: int, faces: np.ndarray) -> sp.csr_matr
     inv_degree = np.zeros_like(degree, dtype=np.float64)
     nonzero = degree > 0
     inv_degree[nonzero] = 1.0 / degree[nonzero]
-    laplacian = sp.eye(num_vertices, format="csr", dtype=np.float64) - sp.diags(inv_degree) @ adjacency
+    # Match downstream: isolated vertices have an all-zero row, not I[i, i]=1.
+    laplacian = sp.diags(nonzero.astype(np.float64)) - sp.diags(inv_degree) @ adjacency
     return laplacian.tocsr()
