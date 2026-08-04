@@ -268,5 +268,8 @@ def build_uniform_laplacian(num_vertices: int, faces: np.ndarray) -> sp.csr_matr
     data = np.ones(len(row), dtype=np.float64)
     adjacency = sp.csr_matrix((data, (row, col)), shape=(num_vertices, num_vertices))
     degree = np.asarray(adjacency.sum(axis=1)).reshape(-1)
-    laplacian = sp.diags(degree) - adjacency
+    inv_degree = np.zeros_like(degree, dtype=np.float64)
+    nonzero = degree > 0
+    inv_degree[nonzero] = 1.0 / degree[nonzero]
+    laplacian = sp.eye(num_vertices, format="csr", dtype=np.float64) - sp.diags(inv_degree) @ adjacency
     return laplacian.tocsr()

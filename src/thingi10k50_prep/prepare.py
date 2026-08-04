@@ -15,6 +15,11 @@ import thingi10k
 import trimesh
 from tqdm import tqdm
 
+from mlr.datasets import load_reconstruction_input
+from mlr.io import load_mesh, save_mesh
+from mlr.laplacian import build_uniform_laplacian as mlr_build_uniform_laplacian
+from mlr.synthetic import SyntheticRenderConfig, generate_synthetic_dataset
+
 from .config import PrepareConfig
 from .io_utils import ensure_dir, save_mesh_npz, setup_logger, write_csv, write_json
 from .mesh_ops import (
@@ -86,23 +91,23 @@ def _write_contract_report(root: Path) -> None:
     reports = root / "reports"
     ensure_dir(reports)
     contract = reports / "existing_pipeline_contract.md"
-    if contract.exists():
-        return
 
-    repo_root = "not_a_git_repository"
-    commit = "not_available"
+    mlr_repo_root = "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/multiview-laplacian-refinement"
+    mlr_branch = "main"
+    mlr_commit = "b1ab020f4e7d73f1345da58e9d1e6547e20b38c0"
     payload = (
         "# Existing pipeline contract\n\n"
-        f"- Repository root: `{repo_root}`\n"
-        f"- Active commit: `{commit}`\n"
-        "- Entry point: not found (no experiment repository detected in current workspace)\n"
-        "- Directory structure expected by this project: `data/thingi10k50/...`\n"
-        "- Normalization convention: fallback AABB-center + longest-side-to-2.0\n"
-        "- Coarse mesh target: fallback ~3500 vertices\n"
-        "- Midpoint subdivision steps: fallback 1\n"
-        "- Laplacian type: uniform combinatorial (D - A)\n"
+        f"- Repository root: `{mlr_repo_root}`\n"
+        f"- Active branch: `{mlr_branch}`\n"
+        f"- Active commit: `{mlr_commit}`\n"
+        "- Entry point: `mlr.cli:main` via `mlr` console script\n"
+        "- Directory structure expected by this project: `views/images`, `views/masks`, `views/depth`, `views/cameras.json`, `views/dataset.json`, `views/mesh.obj`\n"
+        "- Normalization convention: AABB-center + longest-side-to-2.0, with renderer `normalize_mesh=False` for already normalized meshes\n"
+        "- Coarse mesh target: 3500 vertices\n"
+        "- Midpoint subdivision steps: 1\n"
+        "- Laplacian type: downstream uniform operator `I - D^-1 A`\n"
         "- Target quantity: `delta_target = L_exp @ target_positions`\n"
-        "- Multi-view inputs: configured, generation hook provided, renderer unspecified in this workspace\n"
+        "- Multi-view inputs: downstream-compatible synthetic renderer from `mlr.synthetic`\n"
         "- Train/val/test expectations: split JSON/CSV with 40/5/5 IDs\n"
     )
     contract.write_text(payload, encoding="utf-8")
@@ -273,6 +278,10 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 for mesh_name in ("gt_mesh.npz", "coarse_mesh.npz", "expanded_mesh.npz"):
                     mesh_v, mesh_f = _load_npz_mesh(out_dir / mesh_name)
                     output_issues.extend(_check_mesh(mesh_v, mesh_f))
+
+                views_dataset = out_dir / "views" / "dataset.json"
+                if not views_dataset.exists():
+                    output_issues.append("missing_views_dataset")
                 if not output_issues:
                     logger.info("Skipping already valid model %s", file_id)
                     manifest_rows.append(metrics["manifest_row"])
@@ -320,7 +329,38 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
             np.savez_compressed(out_dir / "laplacian_targets.npz", laplacian_target=delta_target.astype(np.float32))
 
             _preview(out_dir / "preview.png", gt_norm_v, coarse.vertices, expanded.vertices)
-            ensure_dir(out_dir / "views")
+            views_dir = out_dir / "views"
+            ensure_dir(views_dir)
+            render_cfg = SyntheticRenderConfig(
+                num_views=cfg.views_count,
+                width=cfg.views_width,
+                height=cfg.views_height,
+                trajectory="sphere",
+                min_elevation_degrees=-60.0,
+                max_elevation_degrees=60.0,
+                render_mode="lit",
+                backend="cpu",
+                normalize_mesh=False,
+            )
+            rendered = generate_synthetic_dataset(
+                mesh=trimesh.Trimesh(vertices=gt_norm_v.astype(np.float64), faces=gt_f.astype(np.int64), process=False),
+                out_dir=views_dir,
+                config=render_cfg,
+                source_mesh_path=out_dir / "gt_mesh.obj",
+            )
+            mesh = load_mesh(out_dir / "gt_mesh.obj")
+            rendered_mesh = load_mesh(views_dir / "mesh.obj")
+            if not np.allclose(rendered_mesh.vertices, mesh.vertices, atol=1e-5):
+                raise RuntimeError("Rendered mesh does not match prepared normalized GT mesh")
+            dataset_json = views_dir / "dataset.json"
+            dataset = load_reconstruction_input(dataset_json)
+            if len(dataset.image_paths) != cfg.views_count:
+                raise RuntimeError("Unexpected number of rendered views")
+
+            for rel_path in ["images", "masks", "depth"]:
+                ensure_dir(views_dir / rel_path)
+
+            write_json(out_dir / "views_dataset.json", {"path": str(dataset_json), "views": len(dataset.image_paths)})
 
             dist = targets["surface_distance"]
             manifest_row = {

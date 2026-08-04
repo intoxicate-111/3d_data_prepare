@@ -8,6 +8,10 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
+from mlr.datasets import load_reconstruction_input
+from mlr.io import load_mesh
+from mlr.laplacian import build_uniform_laplacian as mlr_build_uniform_laplacian
+
 from .io_utils import write_csv
 
 
@@ -62,9 +66,12 @@ def validate_dataset(data_root: str | Path) -> None:
             targets = np.load(model_dir / "targets.npz")
             lap = sp.load_npz(model_dir / "laplacian.npz")
             delta = np.load(model_dir / "laplacian_targets.npz")["laplacian_target"]
-
             target_positions = targets["target_positions"]
             distances = targets["surface_distance"]
+            closest_faces = targets["closest_face_indices"]
+            bary = targets["closest_barycentric_coordinates"]
+            valid_mask = targets["valid_mask"]
+
             if target_positions.shape != (len(exp_v), 3):
                 issues.append("target_positions_shape_mismatch")
             if delta.shape != (len(exp_v), 3):
@@ -73,6 +80,45 @@ def validate_dataset(data_root: str | Path) -> None:
                 issues.append("laplacian_shape_mismatch")
             if not np.isfinite(distances).all():
                 issues.append("non_finite_projection_distance")
+            if not np.isfinite(target_positions).all():
+                issues.append("non_finite_target_positions")
+            if np.any(closest_faces < 0) or np.any(closest_faces >= len(gt_v)):
+                issues.append("invalid_closest_face_indices")
+            if np.any(np.abs(bary.sum(axis=1) - 1.0) > 1e-5):
+                issues.append("barycentric_sum_mismatch")
+            if not np.isfinite(bary).all():
+                issues.append("non_finite_barycentric_coordinates")
+            if valid_mask.shape != (len(exp_v),):
+                issues.append("valid_mask_shape_mismatch")
+            if not np.all(valid_mask[valid_mask.astype(bool)]):
+                issues.append("invalid_valid_mask")
+            if not np.isfinite(lap.data).all():
+                issues.append("non_finite_laplacian")
+
+            dataset_json = model_dir / "views" / "dataset.json"
+            if not dataset_json.exists():
+                issues.append("missing_views_dataset_json")
+            else:
+                dataset = load_reconstruction_input(dataset_json)
+                if len(dataset.image_paths) != 40:
+                    issues.append("unexpected_view_count")
+                if not (model_dir / "views" / "cameras.json").exists():
+                    issues.append("missing_cameras_json")
+                if not (model_dir / "views" / "mesh.obj").exists():
+                    issues.append("missing_view_mesh_obj")
+
+            for mesh_name in ("gt_mesh.obj", "coarse_mesh.obj", "expanded_mesh.obj"):
+                try:
+                    load_mesh(model_dir / mesh_name)
+                except Exception as exc:  # noqa: BLE001
+                    issues.append(f"load_mesh_failed:{mesh_name}:{exc}")
+
+            expected_lap = mlr_build_uniform_laplacian(len(exp_v), exp_f)
+            if not np.allclose(lap.toarray(), expected_lap, rtol=0.0, atol=1e-12):
+                issues.append("laplacian_contract_mismatch")
+            expected_delta = expected_lap @ target_positions
+            if not np.allclose(delta, expected_delta, rtol=0.0, atol=1e-12):
+                issues.append("laplacian_target_contract_mismatch")
         except Exception as exc:  # noqa: BLE001
             issues.append(f"validation_exception:{exc}")
 
@@ -88,6 +134,12 @@ def validate_dataset(data_root: str | Path) -> None:
     invalid = [r for r in rows if r["status"] != "valid"]
     if invalid:
         raise RuntimeError(f"Validation failed for {len(invalid)} models")
+
+    split = json.loads((root / "split.json").read_text(encoding="utf-8"))
+    if len(manifest) != 50:
+        raise RuntimeError(f"Expected 50 manifest rows, found {len(manifest)}")
+    if len(split["train"]) != 40 or len(split["val"]) != 5 or len(split["test"]) != 5:
+        raise RuntimeError("Split counts do not match 40/5/5")
 
     report = {"total_models": len(rows), "valid_models": len(rows), "invalid_models": 0}
     (root / "reports" / "validation_summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

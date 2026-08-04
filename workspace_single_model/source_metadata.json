@@ -1,0 +1,30 @@
+{
+  "PWN": true,
+  "author": "MakeALot",
+  "category": "household",
+  "closed": true,
+  "date": "2012-11-23",
+  "edge_manifold": true,
+  "euler": 2,
+  "file_id": 101864,
+  "file_path": "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/thingi10k50/data/.cache/thingi10k/extracted/2574aab087e596a0246bddf5df4f9bdbac1463c35bd3e007f755ff3100fb753b/npz/101864.npz",
+  "license": "Creative Commons - Attribution",
+  "name": "Tardis with drawers ",
+  "num_boundary_edges": 0,
+  "num_components": 1,
+  "num_facets": 14884,
+  "num_vertices": 7444,
+  "oriented": true,
+  "self_intersecting": false,
+  "solid": true,
+  "subcategory": "containers",
+  "tags": [
+    "doctor_who",
+    "drawers",
+    "LulzBot",
+    "storage",
+    "tardis"
+  ],
+  "thing_id": 35167,
+  "vertex_manifold": true
+}

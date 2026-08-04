@@ -5,19 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "thingi10k50-prep"
 version = "0.1.0"
-description = "Reproducible preparation pipeline for Thingi10K50 Laplacian experiment data."
+description = "Consumer-compatible data preparation pipeline for multiview-laplacian-refinement."
 readme = "THINGI10K50_PREPARATION_TASK.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.24",
-  "scipy>=1.10",
+  "scipy>=1.11",
   "pandas>=2.0",
   "PyYAML>=6.0",
   "trimesh>=4.0",
   "thingi10k>=0.0.7",
   "tqdm>=4.66",
-  "fast-simplification>=0.1.8",
   "matplotlib>=3.8",
+  "Pillow>=10",
 ]
 
 [project.scripts]
