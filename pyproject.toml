@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "thingi10k50-prep"
+version = "0.1.0"
+description = "Reproducible preparation pipeline for Thingi10K50 Laplacian experiment data."
+readme = "THINGI10K50_PREPARATION_TASK.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "pandas>=2.0",
+  "PyYAML>=6.0",
+  "trimesh>=4.0",
+  "thingi10k>=0.0.7",
+  "tqdm>=4.66",
+  "fast-simplification>=0.1.8",
+  "matplotlib>=3.8",
+]
+
+[project.scripts]
+prepare-thingi10k50 = "thingi10k50_prep.cli:prepare_main"
+validate-thingi10k50 = "thingi10k50_prep.cli:validate_main"
+smoke-test-thingi10k50 = "thingi10k50_prep.cli:smoke_main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

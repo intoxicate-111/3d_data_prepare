@@ -1,0 +1,28 @@
+seed: 20260804
+cache_dir: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/thingi10k50/data/.cache/thingi10k"
+output_root: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/thingi10k50/sample"
+log_file: "prepare.log"
+force: false
+max_faces: 200000
+min_vertices: 1000
+min_faces: 2000
+known_corrupt_ids: [49911, 74463, 286163, 81313, 77942]
+strata:
+  - {name: "low", min_faces: 2000, max_faces: 20000, count: 15}
+  - {name: "mid", min_faces: 20000, max_faces: 60000, count: 20}
+  - {name: "high", min_faces: 60000, max_faces: 200000, count: 15}
+split:
+  train: 40
+  val: 5
+  test: 5
+normalization:
+  mode: "aabb_center_longest_to_2"
+coarse_mesh:
+  target_vertices: 3500
+  min_vertices: 1000
+subdivision:
+  steps: 1
+views:
+  count: 40
+  width: 1024
+  height: 1024

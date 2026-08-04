@@ -1,0 +1,61 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "check-git",
+			"type": "shell",
+			"command": "pwd && git --version && gh --version",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "inspect-github-auth",
+			"type": "shell",
+			"command": "echo 'USER='\"$USER\"; echo 'HOME='\"$HOME\"; env | grep -Ei '^(GITHUB|GH|GIT)_|TOKEN|USERNAME' | sed 's/=.*$/=***hidden***/' || true; git config --global --list | sed -n '1,80p' || true; git config --local --list | sed -n '1,80p' || true",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "check-github-access",
+			"type": "shell",
+			"command": "echo '--- SSH keys ---' && ls -la ~/.ssh 2>/dev/null || true && echo '--- SSH test ---' && ssh -T -o BatchMode=yes -o StrictHostKeyChecking=no git@github.com 2>&1 | sed -n '1,20p' || true",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "inspect-git-credentials",
+			"type": "shell",
+			"command": "echo '--- global config ---' && git config --global --list --show-origin || true && echo '--- credential helper ---' && git config --global --get credential.helper || true && echo '--- git credentials file ---' && if [ -f ~/.git-credentials ]; then echo exists; sed -n '1p' ~/.git-credentials | sed 's/:[^:@]*@/:***@/'; else echo 'not found'; fi && echo '--- netrc ---' && if [ -f ~/.netrc ]; then echo exists; sed -n '1,5p' ~/.netrc | sed -E 's/(password).*/\\1=***hidden***/; else echo 'not found'; fi",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "probe-github-env",
+			"type": "shell",
+			"command": "python - <<'PY'\nimport os, re\nfor k in sorted(os.environ):\n    if re.search(r'^(GITHUB|GH|GIT|TOKEN|USERNAME|USER|PASSWORD)', k):\n        v=os.environ[k]\n        if len(v) > 0:\n            print(k, '=' + ('*' * min(8,len(v))) + (' ' if len(v)>8 else ''))\nPY",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "check-git-remote-setup",
+			"type": "shell",
+			"command": "set -e\ncd /home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/data_prepare\nprintf '--- repo status ---\\n'\ngit init >/dev/null 2>&1 || true\ngit status --short --branch\nprintf '\\n--- remotes ---\\n'\ngit remote -v || true\nprintf '\\n--- user identity ---\\n'\ngit config user.name || true\ngit config user.email || true\nprintf '\\n--- github auth check ---\\n'\nif [ -f ~/.config/gh/hosts.yml ]; then echo 'gh hosts config exists'; fi\nif [ -f ~/.git-credentials ]; then echo 'git-credentials exists'; fi\nif [ -f ~/.netrc ]; then echo 'netrc exists'; fi",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "inspect-github-credentials-2",
+			"type": "shell",
+			"command": "set -e\ncd /home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/data_prepare\nprintf '%s\n' '--- python ---'\ncommand -v python3 || true\nprintf '%s\n' '--- gh ---'\ncommand -v gh || true\nprintf '%s\n' '--- env vars ---'\nenv | grep -E '^(GITHUB|GH|GIT|TOKEN|USERNAME|USER|PASSWORD)=' | sed 's/=.*$/=***hidden***/' || true\nprintf '%s\n' '--- git config ---'\ngit config --global --list --show-origin || true\nprintf '%s\n' '--- cred files ---'\n[ -f ~/.git-credentials ] && echo '.git-credentials exists' || echo '.git-credentials missing'\n[ -f ~/.netrc ] && echo '.netrc exists' || echo '.netrc missing'\n[ -f ~/.config/gh/hosts.yml ] && echo 'gh hosts exists' || echo 'gh hosts missing'",
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "git-initialize-and-commit",
+			"type": "shell",
+			"command": "set -e\ncd /home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/data_prepare\ngit init\nif ! git config user.name >/dev/null; then git config user.name 'zhou_c'; fi\nif ! git config user.email >/dev/null; then git config user.email 'zhou_c@users.noreply.github.com'; fi\ngit add .\ngit commit -m 'Initial commit'",
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
