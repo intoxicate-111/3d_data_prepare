@@ -26,6 +26,8 @@ def _small_real_sample(sample: dict, size: int = 64) -> dict:
     result["intrinsics"][:, 0, :] *= size / old_w
     result["intrinsics"][:, 1, :] *= size / old_h
     result["extrinsics"] = sample["extrinsics"][:1]
+    if sample.get("image_paths") is not None:
+        result["image_paths"] = sample["image_paths"][:1]
     if sample.get("visibility") is not None:
         result["visibility"] = sample["visibility"][:1]
     return validate_sample(result)

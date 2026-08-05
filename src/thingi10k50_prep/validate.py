@@ -121,9 +121,17 @@ def validate_dataset(data_root: str | Path) -> None:
                 issues.append("missing_views_dataset_json")
             else:
                 dataset = load_reconstruction_input(dataset_json)
+                dataset_payload = json.loads(dataset_json.read_text(encoding="utf-8"))
+                depth_values = dataset_payload.get("depth_paths", [])
+                depth_paths = [
+                    Path(value) if Path(value).is_absolute() else dataset_json.parent / value
+                    for value in depth_values
+                ]
                 expected_views = int(manifest.loc[manifest["file_id"] == file_id, "views_count"].iloc[0])
                 if len(dataset.image_paths) != expected_views:
                     issues.append("unexpected_view_count")
+                if len(depth_paths) != expected_views:
+                    issues.append("unexpected_depth_path_count")
                 if expected_views == 14:
                     half_extent = float(
                         manifest.loc[manifest["file_id"] == file_id, "cube_half_extent"].iloc[0]
@@ -145,7 +153,7 @@ def validate_dataset(data_root: str | Path) -> None:
                     if not np.allclose(actual_forward, expected_forward, atol=1e-8, rtol=0.0):
                         issues.append("cube_camera_orientation_mismatch")
                 for view_index, (image_path, mask_path, depth_path) in enumerate(zip(
-                    dataset.image_paths, dataset.mask_paths, dataset.depth_paths, strict=True
+                    dataset.image_paths, dataset.mask_paths, depth_paths, strict=True
                 )):
                     image = np.asarray(Image.open(image_path).convert("RGB"))
                     mask = np.asarray(Image.open(mask_path)) > 0

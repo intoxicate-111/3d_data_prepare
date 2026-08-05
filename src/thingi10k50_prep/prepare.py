@@ -76,6 +76,71 @@ def _mesh_checksum(vertices: np.ndarray, faces: np.ndarray) -> str:
     return digest.hexdigest()
 
 
+def _expected_geometry_contract(cfg: PrepareConfig) -> dict[str, Any]:
+    return {
+        "normalization_mode": cfg.normalization_mode,
+        "normalization_epsilon": cfg.normalization_epsilon,
+        "coarse_target_vertices": cfg.coarse_target_vertices,
+        "coarse_min_vertices": cfg.coarse_min_vertices,
+        "subdivision_steps": cfg.subdivision_steps,
+        "target_constructor": "precomputed_closest_surface_on_prediction_graph",
+        "laplacian_operator": "uniform",
+    }
+
+
+def _render_cache_issues(
+    render_metadata: dict[str, Any],
+    cfg: PrepareConfig,
+    normalized_mesh_checksum: str,
+) -> list[str]:
+    issues: list[str] = []
+    if render_metadata.get("trajectory") != cfg.views_trajectory:
+        issues.append("unexpected_view_trajectory")
+    if render_metadata.get("requested_backend", render_metadata.get("backend")) != cfg.views_backend:
+        issues.append("unexpected_render_backend")
+    expected = {
+        "opengl_context_backend": cfg.views_opengl_context_backend,
+        "cube_half_extent": cfg.views_cube_half_extent,
+        "fov_degrees": cfg.views_fov_degrees,
+        "render_mode": cfg.views_render_mode,
+        "antialiasing": cfg.views_antialiasing,
+        "camera_layout_version": VIEW_LAYOUT_VERSION,
+    }
+    issues.extend(
+        f"unexpected_render_{key}"
+        for key, expected_value in expected.items()
+        if render_metadata.get(key) != expected_value
+    )
+    if render_metadata.get("normalized_mesh_checksum") != normalized_mesh_checksum:
+        issues.append("render_mesh_checksum_changed")
+    if (
+        render_metadata.get("width") != cfg.views_width
+        or render_metadata.get("height") != cfg.views_height
+    ):
+        issues.append("unexpected_view_resolution")
+    return issues
+
+
+def _prepared_cache_issues(raw_prepared: dict[str, Any], cfg: PrepareConfig) -> list[str]:
+    issues: list[str] = []
+    if "images" in raw_prepared:
+        issues.append("prepared_sample_embeds_images")
+    if raw_prepared.get("prepared_storage_format") != cfg.prepared_samples.storage_format:
+        issues.append("prepared_sample_storage_contract_changed")
+    if len(raw_prepared.get("image_paths", [])) != cfg.views_count:
+        issues.append("prepared_sample_image_paths_changed")
+    if tuple(raw_prepared.get("intrinsics", torch.empty(0)).shape) != (cfg.views_count, 3, 3):
+        issues.append("prepared_sample_intrinsics_changed")
+    if tuple(raw_prepared.get("extrinsics", torch.empty(0)).shape) != (cfg.views_count, 4, 4):
+        issues.append("prepared_sample_extrinsics_changed")
+    metadata = raw_prepared.get("metadata", {})
+    if metadata.get("normalization_mode") != cfg.normalization_mode:
+        issues.append("prepared_sample_normalization_changed")
+    if metadata.get("view_layout_version") != VIEW_LAYOUT_VERSION:
+        issues.append("prepared_sample_view_layout_changed")
+    return issues
+
+
 def _build_prepared_sample(
     dataset_json: Path,
     expanded_obj: Path,
@@ -543,15 +608,7 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 from .validate import _check_mesh, _load_npz_mesh
 
                 output_issues: list[str] = []
-                expected_geometry_contract = {
-                    "normalization_mode": cfg.normalization_mode,
-                    "normalization_epsilon": cfg.normalization_epsilon,
-                    "coarse_target_vertices": cfg.coarse_target_vertices,
-                    "coarse_min_vertices": cfg.coarse_min_vertices,
-                    "subdivision_steps": cfg.subdivision_steps,
-                    "target_constructor": "precomputed_closest_surface_on_prediction_graph",
-                    "laplacian_operator": "uniform",
-                }
+                expected_geometry_contract = _expected_geometry_contract(cfg)
                 if metrics.get("geometry_contract") != expected_geometry_contract:
                     output_issues.append("geometry_contract_changed")
                 for mesh_name in ("gt_mesh.npz", "coarse_mesh.npz", "expanded_mesh.npz"):
@@ -568,30 +625,11 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                         render_metadata = json.loads(views_dataset.read_text(encoding="utf-8")).get("config", {})
                         if len(reconstruction.image_paths) != cfg.views_count:
                             output_issues.append("unexpected_view_count")
-                        if render_metadata.get("trajectory") != cfg.views_trajectory:
-                            output_issues.append("unexpected_view_trajectory")
-                        if render_metadata.get("requested_backend", render_metadata.get("backend")) != cfg.views_backend:
-                            output_issues.append("unexpected_render_backend")
-                        expected_render_metadata = {
-                            "opengl_context_backend": cfg.views_opengl_context_backend,
-                            "cube_half_extent": cfg.views_cube_half_extent,
-                            "fov_degrees": cfg.views_fov_degrees,
-                            "render_mode": cfg.views_render_mode,
-                            "antialiasing": cfg.views_antialiasing,
-                            "camera_layout_version": VIEW_LAYOUT_VERSION,
-                        }
-                        for key, expected_value in expected_render_metadata.items():
-                            if render_metadata.get(key) != expected_value:
-                                output_issues.append(f"unexpected_render_{key}")
                         gt_mesh = load_mesh(out_dir / "gt_mesh.obj")
                         expected_mesh_checksum = _mesh_checksum(gt_mesh.vertices, gt_mesh.faces)
-                        if render_metadata.get("normalized_mesh_checksum") != expected_mesh_checksum:
-                            output_issues.append("render_mesh_checksum_changed")
-                        if (
-                            render_metadata.get("width") != cfg.views_width
-                            or render_metadata.get("height") != cfg.views_height
-                        ):
-                            output_issues.append("unexpected_view_resolution")
+                        output_issues.extend(
+                            _render_cache_issues(render_metadata, cfg, expected_mesh_checksum)
+                        )
                     except Exception as exc:  # noqa: BLE001
                         output_issues.append(f"invalid_views_dataset:{exc}")
                 if not prepared_path.exists():
@@ -603,21 +641,7 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                         raw_prepared = torch.load(
                             prepared_path, map_location="cpu", weights_only=False
                         )
-                        if "images" in raw_prepared:
-                            output_issues.append("prepared_sample_embeds_images")
-                        if raw_prepared.get("prepared_storage_format") != cfg.prepared_samples.storage_format:
-                            output_issues.append("prepared_sample_storage_contract_changed")
-                        if len(raw_prepared.get("image_paths", [])) != cfg.views_count:
-                            output_issues.append("prepared_sample_image_paths_changed")
-                        if tuple(raw_prepared.get("intrinsics", torch.empty(0)).shape) != (cfg.views_count, 3, 3):
-                            output_issues.append("prepared_sample_intrinsics_changed")
-                        if tuple(raw_prepared.get("extrinsics", torch.empty(0)).shape) != (cfg.views_count, 4, 4):
-                            output_issues.append("prepared_sample_extrinsics_changed")
-                        prepared_metadata = raw_prepared.get("metadata", {})
-                        if prepared_metadata.get("normalization_mode") != cfg.normalization_mode:
-                            output_issues.append("prepared_sample_normalization_changed")
-                        if prepared_metadata.get("view_layout_version") != VIEW_LAYOUT_VERSION:
-                            output_issues.append("prepared_sample_view_layout_changed")
+                        output_issues.extend(_prepared_cache_issues(raw_prepared, cfg))
                     except Exception as exc:  # noqa: BLE001
                         output_issues.append(f"invalid_prepared_sample:{exc}")
                 if not output_issues:
@@ -809,15 +833,7 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 "gt_metrics": _mesh_metrics(gt_norm_v, gt_f),
                 "coarse_metrics": _mesh_metrics(coarse.vertices, coarse.faces),
                 "expanded_metrics": _mesh_metrics(expanded.vertices, expanded.faces),
-                "geometry_contract": {
-                    "normalization_mode": cfg.normalization_mode,
-                    "normalization_epsilon": cfg.normalization_epsilon,
-                    "coarse_target_vertices": cfg.coarse_target_vertices,
-                    "coarse_min_vertices": cfg.coarse_min_vertices,
-                    "subdivision_steps": cfg.subdivision_steps,
-                    "target_constructor": "precomputed_closest_surface_on_prediction_graph",
-                    "laplacian_operator": "uniform",
-                },
+                "geometry_contract": _expected_geometry_contract(cfg),
                 "validation_status": "valid",
                 "manifest_row": manifest_row,
             }
