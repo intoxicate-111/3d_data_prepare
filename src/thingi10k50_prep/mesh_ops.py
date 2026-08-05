@@ -84,7 +84,6 @@ def mesh_cleanup(vertices: np.ndarray, faces: np.ndarray) -> tuple[MeshArrays, l
 
     mesh = _as_mesh(v, f)
     before = len(mesh.vertices)
-    before = len(mesh.vertices)
     mesh.remove_unreferenced_vertices()
     if len(mesh.vertices) != before:
         operations.append("removed_post_merge_unreferenced_vertices")
@@ -167,7 +166,10 @@ def simplify_mesh(vertices: np.ndarray, faces: np.ndarray, target_vertices: int,
     mesh = _as_mesh(vertices, faces)
     if len(mesh.vertices) <= target_vertices:
         compact, _, _ = remove_unreferenced_vertices(np.asarray(mesh.vertices), np.asarray(mesh.faces))
-        return compact
+        cleaned, _ = mesh_cleanup(compact.vertices, compact.faces)
+        if len(cleaned.vertices) < min_vertices:
+            raise RuntimeError("Simplification cleanup produced too few vertices")
+        return cleaned
 
     target_vertices = max(target_vertices, min_vertices)
     ratio = float(target_vertices) / float(len(mesh.vertices))
@@ -182,7 +184,10 @@ def simplify_mesh(vertices: np.ndarray, faces: np.ndarray, target_vertices: int,
     if simplified is None or len(simplified.vertices) < min_vertices:
         raise RuntimeError("Simplification failed or produced too few vertices")
     compact, _, _ = remove_unreferenced_vertices(np.asarray(simplified.vertices), np.asarray(simplified.faces))
-    return compact
+    cleaned, _ = mesh_cleanup(compact.vertices, compact.faces)
+    if len(cleaned.vertices) < min_vertices:
+        raise RuntimeError("Simplification cleanup produced too few vertices")
+    return cleaned
 
 
 def midpoint_subdivide(vertices: np.ndarray, faces: np.ndarray, steps: int) -> tuple[MeshArrays, dict[str, np.ndarray]]:
@@ -277,7 +282,17 @@ def compute_surface_targets(
     normal_norm[normal_norm == 0] = 1.0
     interpolated_normals = interpolated_normals / normal_norm
 
-    valid = np.isfinite(closest_points).all(axis=1) & np.isfinite(distances) & valid_face
+    valid = (
+        np.isfinite(closest_points).all(axis=1)
+        & np.isfinite(distances)
+        & valid_face
+        & np.isfinite(bary).all(axis=1)
+        & np.isfinite(interpolated_normals).all(axis=1)
+    )
+    if not np.all(valid):
+        raise RuntimeError(
+            f"Surface projection produced {int((~valid).sum())} invalid targets"
+        )
     return {
         "target_positions": closest_points.astype(np.float32),
         "target_displacements": (closest_points - expanded_vertices).astype(np.float32),

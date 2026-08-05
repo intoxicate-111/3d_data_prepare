@@ -675,7 +675,16 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 mode=cfg.normalization_mode,
                 epsilon=cfg.normalization_epsilon,
             )
-            gt_f = clean.faces.astype(np.int64)
+            # Casting unit-sphere coordinates to float32 can collapse triangles
+            # whose source-space area was merely tiny. Clean once more in the
+            # exact stored precision so targets never see degenerate GT faces.
+            normalized_clean, normalized_ops = mesh_cleanup(gt_norm_v, clean.faces)
+            gt_norm_v = np.asarray(normalized_clean.vertices, dtype=np.float32)
+            gt_f = np.asarray(normalized_clean.faces, dtype=np.int64)
+            cleanup_ops.extend(f"normalized_{operation}" for operation in normalized_ops)
+            normalized_reason = _post_cleanup_reason(gt_norm_v, gt_f, cfg)
+            if normalized_reason is not None:
+                raise RuntimeError(normalized_reason)
 
             save_mesh_npz(out_dir / "gt_mesh.npz", gt_norm_v, gt_f)
             _save_obj(out_dir / "gt_mesh.obj", gt_norm_v, gt_f)
