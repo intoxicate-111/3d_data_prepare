@@ -168,7 +168,7 @@ def _write_contract_report(root: Path, runtime: DownstreamRuntime) -> None:
         "- Laplacian type: downstream uniform operator `I - D^-1 A`\n"
         "- Target quantity: `delta_target = L_exp @ target_positions`\n"
         "- Multi-view inputs: downstream-compatible synthetic renderer from `mlr.synthetic`\n"
-        "- Train/validation/test expectations: prepared manifest with 40/5/5 disjoint samples\n"
+        "- Train/validation/test expectations are defined by the active preparation config\n"
     )
     contract.write_text(payload, encoding="utf-8")
 
@@ -205,6 +205,18 @@ def _stratum_for_face_count(face_count: int, strata: list[dict[str, Any]]) -> st
     return "out_of_range"
 
 
+def _expected_model_count(cfg: PrepareConfig) -> int:
+    stratum_total = sum(stratum.count for stratum in cfg.strata)
+    split_total = cfg.split.train + cfg.split.val + cfg.split.test
+
+    if stratum_total != split_total:
+        raise ValueError(
+            "Stratum and split totals must match: "
+            f"strata={stratum_total}, split={split_total}"
+        )
+
+    return stratum_total
+
 def _sample_stratified(valid_rows: list[dict[str, Any]], cfg: PrepareConfig) -> list[dict[str, Any]]:
     random.seed(cfg.seed)
     by_stratum: dict[str, list[dict[str, Any]]] = {s.name: [] for s in cfg.strata}
@@ -228,7 +240,9 @@ def _sample_stratified(valid_rows: list[dict[str, Any]], cfg: PrepareConfig) -> 
                 break
         selected.extend(pick)
 
-    if len(selected) < 50:
+    target_count = _expected_model_count(cfg)
+
+    if len(selected) < target_count:
         remaining = [r for r in valid_rows if r["file_id"] not in {x["file_id"] for x in selected}]
         random.shuffle(remaining)
         for row in remaining:
@@ -238,13 +252,15 @@ def _sample_stratified(valid_rows: list[dict[str, Any]], cfg: PrepareConfig) -> 
             selected.append(row)
             if thing_id > 0:
                 used_things.add(thing_id)
-            if len(selected) == 50:
+            if len(selected) == target_count:
                 break
 
-    if len(selected) != 50:
-        raise RuntimeError(f"Unable to sample 50 models; got {len(selected)} valid selections")
+    if len(selected) != target_count:
+        raise RuntimeError(
+            f"Unable to sample {target_count} models; "
+            f"got {len(selected)} valid selections"
+        )
     return selected
-
 
 def _make_split(selected: list[dict[str, Any]], cfg: PrepareConfig) -> dict[str, list[int]]:
     random.seed(cfg.seed)
@@ -554,8 +570,13 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 logger.error("No eligible later replacement for failed model %s", file_id)
             write_csv(output_root / "failed_models.csv", failed_rows)
 
-    if len(manifest_rows) != 50:
-        raise RuntimeError(f"Expected 50 prepared models, got {len(manifest_rows)}")
+    expected_count = _expected_model_count(cfg)
+
+    if len(manifest_rows) != expected_count:
+        raise RuntimeError(
+            f"Expected {expected_count} prepared models, "
+            f"got {len(manifest_rows)}"
+        )
 
     write_csv(output_root / "manifest.csv", manifest_rows)
     write_json(output_root / "manifest.json", manifest_rows)

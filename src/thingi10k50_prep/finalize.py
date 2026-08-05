@@ -17,6 +17,29 @@ from .prepare import _build_prepared_sample, _write_contract_report
 
 def finalize_cached_dataset(config_path: str | Path) -> None:
     cfg = load_config(config_path)
+
+    expected_total = sum(
+        stratum.count
+        for stratum in cfg.strata
+    )
+
+    expected_split_counts = {
+        "train": cfg.split.train,
+        "validation": cfg.split.val,
+        "test": cfg.split.test,
+    }
+
+    configured_split_total = sum(
+        expected_split_counts.values()
+    )
+
+    if expected_total != configured_split_total:
+        raise ValueError(
+            "Stratum and split totals must match: "
+            f"strata={expected_total}, "
+            f"split={configured_split_total}"
+        )
+
     runtime = validate_downstream(cfg.downstream)
     from mlr.datasets import load_reconstruction_input
     from mlr.io import load_mesh
@@ -25,14 +48,27 @@ def finalize_cached_dataset(config_path: str | Path) -> None:
 
     root = Path(cfg.output_root)
     manifest = pd.read_csv(root / "manifest.csv")
-    if len(manifest) != 50:
-        raise RuntimeError(f"Cached manifest must contain 50 models, found {len(manifest)}")
+    if len(manifest) != expected_total:
+        raise RuntimeError(f"Cached manifest must contain {expected_total} models, found {len(manifest)}")
     split = json.loads((root / "split.json").read_text(encoding="utf-8"))
     if "val" in split:
         split["validation"] = split.pop("val")
     id_to_split = {int(file_id): name for name, ids in split.items() for file_id in ids}
-    if sorted(len(split[name]) for name in ("train", "validation", "test")) != [5, 5, 40]:
-        raise RuntimeError("Split must contain 40/5/5 train/validation/test models")
+    actual_split_counts = {
+        name: len(split[name])
+        for name in (
+            "train",
+            "validation",
+            "test",
+        )
+    }
+
+    if actual_split_counts != expected_split_counts:
+        raise RuntimeError(
+            "Split counts do not match config: "
+            f"expected={expected_split_counts}, "
+            f"actual={actual_split_counts}"
+        )
 
     prepared_root = root / cfg.prepared_samples.directory
     ensure_dir(prepared_root)
@@ -117,8 +153,11 @@ def finalize_cached_dataset(config_path: str | Path) -> None:
             failures.append({"file_id": file_id, "reason": f"finalization_failure: {exc}"})
             write_csv(root / "failed_models.csv", failures)
 
-    if len(rows) != 50:
-        raise RuntimeError(f"Expected 50 finalized models, got {len(rows)}; failures={failures}")
+    if len(rows) != expected_total:
+        raise RuntimeError(
+            f"Expected {expected_total} finalized models, "
+            f"got {len(rows)}; failures={failures}"
+        )
     write_csv(root / "manifest.csv", rows)
     write_json(root / "manifest.json", rows)
     write_json(root / cfg.prepared_samples.manifest, {

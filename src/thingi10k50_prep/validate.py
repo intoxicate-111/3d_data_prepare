@@ -163,16 +163,46 @@ def validate_dataset(data_root: str | Path) -> None:
         raise RuntimeError(f"Validation failed for {len(invalid)} models")
 
     split = json.loads((root / "split.json").read_text(encoding="utf-8"))
-    if len(manifest) != 50:
-        raise RuntimeError(f"Expected 50 manifest rows, found {len(manifest)}")
-    if len(split["train"]) != 40 or len(split["validation"]) != 5 or len(split["test"]) != 5:
-        raise RuntimeError("Split counts do not match 40/5/5")
+
+    split_names = ("train", "validation", "test")
+
+    expected_split_counts = {
+        name: len(split[name])
+        for name in split_names
+    }
+
+    expected_total = sum(expected_split_counts.values())
+
+    if len(manifest) != expected_total:
+        raise RuntimeError(
+            f"Expected {expected_total} manifest rows, "
+            f"found {len(manifest)}"
+        )
+
 
     prepared_manifest = root / "prepared_manifest.json"
-    datasets = [PreparedMeshDataset.from_manifest(prepared_manifest, name) for name in ("train", "validation", "test")]
+
+    datasets = [
+        PreparedMeshDataset.from_manifest(
+            prepared_manifest,
+            split_name,
+        )
+        for split_name in split_names
+    ]
+
     validate_disjoint_splits(*datasets)
-    if [len(dataset) for dataset in datasets] != [40, 5, 5]:
-        raise RuntimeError("Prepared manifest split counts do not match 40/5/5")
+
+    actual_split_counts = {
+        split_name: len(dataset)
+        for split_name, dataset in zip(split_names, datasets)
+    }
+
+    if actual_split_counts != expected_split_counts:
+        raise RuntimeError(
+            "Prepared manifest split counts do not match split.json: "
+            f"expected={expected_split_counts}, "
+            f"actual={actual_split_counts}"
+        )
 
     report = {"total_models": len(rows), "valid_models": len(rows), "invalid_models": 0}
     (root / "reports" / "validation_summary.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
