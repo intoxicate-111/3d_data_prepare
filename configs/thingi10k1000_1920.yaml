@@ -1,7 +1,7 @@
 seed: 20260804
 
 cache_dir: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/thingi10k50/data/.cache/thingi10k"
-output_root: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/thingi10k50/sample_5000"
+output_root: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/thingi10k1000/sample_1000"
 
 log_file: "prepare.log"
 force: false
@@ -24,7 +24,8 @@ split:
   test: 100
 
 normalization:
-  mode: "aabb_center_longest_to_2"
+  mode: "unit_sphere_max_radius"
+  epsilon: 1.0e-12
 
 coarse_mesh:
   target_vertices: 3500
@@ -34,14 +35,21 @@ subdivision:
   steps: 1
 
 views:
-  count: 16
+  count: 14
   width: 1920
   height: 1920
+  trajectory: "cube_surface"
+  backend: "opengl"
+  opengl_context_backend: "egl"
+  cube_half_extent: 1.5
+  fov_degrees: 90.0
+  render_mode: "lit"
+  antialiasing: "msaa4"
 
 downstream:
   repo_url: "https://github.com/intoxicate-111/multiview-laplacian-refinement.git"
   repo_root: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/multiview-laplacian-refinement"
-  branch: "fix/clean-bunny-normalized-laplacian"
+  branch: "feat/unit-sphere-cube-lazy-samples"
 
 prepared_samples:
   directory: "prepared"
@@ -49,3 +57,4 @@ prepared_samples:
   image_size: 1920
   target_mode: "edge_scale_normalized_laplacian"
   edge_scale_epsilon: 1.0e-12
+  storage_format: "lazy_image_paths_v1"

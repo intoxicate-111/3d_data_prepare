@@ -36,6 +36,7 @@ class PreparedSampleConfig:
     image_size: int
     target_mode: str
     edge_scale_epsilon: float
+    storage_format: str
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,7 @@ class PrepareConfig:
     strata: list[StratumConfig]
     split: SplitConfig
     normalization_mode: str
+    normalization_epsilon: float
     coarse_target_vertices: int
     coarse_min_vertices: int
     subdivision_steps: int
@@ -60,6 +62,11 @@ class PrepareConfig:
     views_height: int
     views_backend: str
     views_trajectory: str
+    views_opengl_context_backend: str
+    views_cube_half_extent: float
+    views_fov_degrees: float
+    views_render_mode: str
+    views_antialiasing: str
     downstream: DownstreamConfig
     prepared_samples: PreparedSampleConfig
 
@@ -72,7 +79,15 @@ def load_config(path: str | Path) -> PrepareConfig:
     strata = [StratumConfig(**item) for item in raw["strata"]]
     split = SplitConfig(**raw["split"])
     downstream = DownstreamConfig(**raw["downstream"])
-    prepared_samples = PreparedSampleConfig(**raw["prepared_samples"])
+    prepared_raw = raw["prepared_samples"]
+    prepared_samples = PreparedSampleConfig(
+        directory=str(prepared_raw["directory"]),
+        manifest=str(prepared_raw["manifest"]),
+        image_size=int(prepared_raw["image_size"]),
+        target_mode=str(prepared_raw["target_mode"]),
+        edge_scale_epsilon=float(prepared_raw["edge_scale_epsilon"]),
+        storage_format=str(prepared_raw.get("storage_format", "embedded_images_v1")),
+    )
     return PrepareConfig(
         seed=int(raw["seed"]),
         cache_dir=str(raw["cache_dir"]),
@@ -86,14 +101,20 @@ def load_config(path: str | Path) -> PrepareConfig:
         strata=strata,
         split=split,
         normalization_mode=str(raw["normalization"]["mode"]),
+        normalization_epsilon=float(raw["normalization"].get("epsilon", 1e-12)),
         coarse_target_vertices=int(raw["coarse_mesh"]["target_vertices"]),
         coarse_min_vertices=int(raw["coarse_mesh"]["min_vertices"]),
         subdivision_steps=int(raw["subdivision"]["steps"]),
         views_count=int(raw["views"]["count"]),
         views_width=int(raw["views"]["width"]),
         views_height=int(raw["views"]["height"]),
-        views_backend=str(raw["views"].get("backend", "cuda")),
+        views_backend=str(raw["views"].get("backend", "opengl")),
         views_trajectory=str(raw["views"].get("trajectory", "sphere")),
+        views_opengl_context_backend=str(raw["views"].get("opengl_context_backend", "egl")),
+        views_cube_half_extent=float(raw["views"].get("cube_half_extent", 1.5)),
+        views_fov_degrees=float(raw["views"].get("fov_degrees", 90.0)),
+        views_render_mode=str(raw["views"].get("render_mode", "lit")),
+        views_antialiasing=str(raw["views"].get("antialiasing", "msaa4")),
         downstream=downstream,
         prepared_samples=prepared_samples,
     )

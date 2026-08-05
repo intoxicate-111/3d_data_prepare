@@ -16,6 +16,7 @@ import thingi10k
 import torch
 import trimesh
 from tqdm import tqdm
+from PIL import Image
 
 from .config import PrepareConfig
 from .downstream import DownstreamRuntime, validate_downstream
@@ -29,7 +30,7 @@ from .mesh_ops import (
     normalize_vertices,
     simplify_mesh,
 )
-from .rendering import generate_configured_synthetic_dataset
+from .rendering import CUBE_SURFACE_VIEW_NAMES, VIEW_LAYOUT_VERSION, generate_configured_synthetic_dataset
 
 
 def _entry_int(entry: dict[str, Any], keys: tuple[str, ...], default: int = -1) -> int:
@@ -68,6 +69,13 @@ def _save_obj(path: Path, vertices: np.ndarray, faces: np.ndarray) -> None:
     path.write_text(mesh.export(file_type="obj"), encoding="utf-8")
 
 
+def _mesh_checksum(vertices: np.ndarray, faces: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    digest.update(np.asarray(vertices, dtype=np.float64).tobytes())
+    digest.update(np.asarray(faces, dtype=np.int64).tobytes())
+    return digest.hexdigest()
+
+
 def _build_prepared_sample(
     dataset_json: Path,
     expanded_obj: Path,
@@ -77,17 +85,25 @@ def _build_prepared_sample(
     image_size: int,
     sample_id: str,
     metadata: dict[str, Any],
+    dataset_root: Path,
 ) -> dict[str, Any]:
     """Assemble existing projections through the downstream loader/scaling contract."""
     from mlr.datasets import load_masks, load_reconstruction_input
     from mlr.io import load_mesh
     from mlr.learned_laplacian.dataset import validate_sample
-    from mlr.learned_laplacian.sample_io import _load_images, _mask_visibility
+    from mlr.learned_laplacian.sample_io import _mask_visibility, _resize_mask
 
     reconstruction = load_reconstruction_input(dataset_json)
+    render_metadata = json.loads(dataset_json.read_text(encoding="utf-8")).get("config", {})
+    metadata = dict(metadata)
+    metadata["view_backend"] = render_metadata.get("backend", metadata.get("view_backend"))
     prediction_mesh = load_mesh(expanded_obj).ensure_normals()
     gt_mesh = load_mesh(gt_obj).ensure_normals()
-    images, scale_xy = _load_images(reconstruction.image_paths, image_size)
+    source_sizes = [Image.open(path).size for path in reconstruction.image_paths]
+    if not source_sizes or len(set(source_sizes)) != 1:
+        raise ValueError("All sample images must have one consistent non-empty source size")
+    source_width, source_height = source_sizes[0]
+    scale_xy = (image_size / source_width, image_size / source_height)
     intrinsics: list[np.ndarray] = []
     extrinsics: list[np.ndarray] = []
     for camera in reconstruction.cameras:
@@ -102,11 +118,21 @@ def _build_prepared_sample(
     masks = load_masks(reconstruction.mask_paths)
     visibility = None
     if masks is not None:
-        visibility = _mask_visibility(prediction_mesh.vertices, reconstruction.cameras, masks, scale_xy)
+        resized_masks = [_resize_mask(mask, (image_size, image_size)) for mask in masks]
+        visibility = _mask_visibility(
+            prediction_mesh.vertices, reconstruction.cameras, resized_masks, scale_xy
+        )
+    relative_image_paths = [
+        path.resolve().relative_to(dataset_root.resolve()).as_posix()
+        for path in reconstruction.image_paths
+    ]
     raw_target = laplacian @ targets["target_positions"]
     sample = {
         "sample_id": sample_id,
-        "images": images,
+        "image_paths": relative_image_paths,
+        "source_image_size": [source_width, source_height],
+        "prepared_image_size": image_size,
+        "prepared_storage_format": "lazy_image_paths_v1",
         "intrinsics": torch.as_tensor(np.stack(intrinsics), dtype=torch.float32),
         "extrinsics": torch.as_tensor(np.stack(extrinsics), dtype=torch.float32),
         "vertices": torch.as_tensor(prediction_mesh.vertices, dtype=torch.float32),
@@ -163,7 +189,7 @@ def _write_contract_report(root: Path, runtime: DownstreamRuntime) -> None:
         f"- Data-preparation commit: `{data_prep_sha}`\n"
         "- Entry point: `mlr.cli:main` via `mlr` console script\n"
         "- Directory structure expected by this project: `views/images`, `views/masks`, `views/depth`, `views/cameras.json`, `views/dataset.json`, `views/mesh.obj`\n"
-        "- Normalization convention: AABB-center + longest-side-to-2.0, with renderer `normalize_mesh=False` for already normalized meshes\n"
+        "- Normalization convention: AABB-center + maximum-radius-to-unit-sphere, with renderer `normalize_mesh=False`\n"
         "- Coarse mesh target: 3500 vertices\n"
         "- Midpoint subdivision steps: 1\n"
         "- Laplacian type: downstream uniform operator `I - D^-1 A`\n"
@@ -517,6 +543,17 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 from .validate import _check_mesh, _load_npz_mesh
 
                 output_issues: list[str] = []
+                expected_geometry_contract = {
+                    "normalization_mode": cfg.normalization_mode,
+                    "normalization_epsilon": cfg.normalization_epsilon,
+                    "coarse_target_vertices": cfg.coarse_target_vertices,
+                    "coarse_min_vertices": cfg.coarse_min_vertices,
+                    "subdivision_steps": cfg.subdivision_steps,
+                    "target_constructor": "precomputed_closest_surface_on_prediction_graph",
+                    "laplacian_operator": "uniform",
+                }
+                if metrics.get("geometry_contract") != expected_geometry_contract:
+                    output_issues.append("geometry_contract_changed")
                 for mesh_name in ("gt_mesh.npz", "coarse_mesh.npz", "expanded_mesh.npz"):
                     mesh_v, mesh_f = _load_npz_mesh(out_dir / mesh_name)
                     output_issues.extend(_check_mesh(mesh_v, mesh_f))
@@ -533,8 +570,23 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                             output_issues.append("unexpected_view_count")
                         if render_metadata.get("trajectory") != cfg.views_trajectory:
                             output_issues.append("unexpected_view_trajectory")
-                        if render_metadata.get("backend") != cfg.views_backend:
+                        if render_metadata.get("requested_backend", render_metadata.get("backend")) != cfg.views_backend:
                             output_issues.append("unexpected_render_backend")
+                        expected_render_metadata = {
+                            "opengl_context_backend": cfg.views_opengl_context_backend,
+                            "cube_half_extent": cfg.views_cube_half_extent,
+                            "fov_degrees": cfg.views_fov_degrees,
+                            "render_mode": cfg.views_render_mode,
+                            "antialiasing": cfg.views_antialiasing,
+                            "camera_layout_version": VIEW_LAYOUT_VERSION,
+                        }
+                        for key, expected_value in expected_render_metadata.items():
+                            if render_metadata.get(key) != expected_value:
+                                output_issues.append(f"unexpected_render_{key}")
+                        gt_mesh = load_mesh(out_dir / "gt_mesh.obj")
+                        expected_mesh_checksum = _mesh_checksum(gt_mesh.vertices, gt_mesh.faces)
+                        if render_metadata.get("normalized_mesh_checksum") != expected_mesh_checksum:
+                            output_issues.append("render_mesh_checksum_changed")
                         if (
                             render_metadata.get("width") != cfg.views_width
                             or render_metadata.get("height") != cfg.views_height
@@ -544,6 +596,30 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                         output_issues.append(f"invalid_views_dataset:{exc}")
                 if not prepared_path.exists():
                     output_issues.append("missing_prepared_sample")
+                elif metrics.get("manifest_row", {}).get("prepared_storage_format") != cfg.prepared_samples.storage_format:
+                    output_issues.append("prepared_storage_format_changed")
+                else:
+                    try:
+                        raw_prepared = torch.load(
+                            prepared_path, map_location="cpu", weights_only=False
+                        )
+                        if "images" in raw_prepared:
+                            output_issues.append("prepared_sample_embeds_images")
+                        if raw_prepared.get("prepared_storage_format") != cfg.prepared_samples.storage_format:
+                            output_issues.append("prepared_sample_storage_contract_changed")
+                        if len(raw_prepared.get("image_paths", [])) != cfg.views_count:
+                            output_issues.append("prepared_sample_image_paths_changed")
+                        if tuple(raw_prepared.get("intrinsics", torch.empty(0)).shape) != (cfg.views_count, 3, 3):
+                            output_issues.append("prepared_sample_intrinsics_changed")
+                        if tuple(raw_prepared.get("extrinsics", torch.empty(0)).shape) != (cfg.views_count, 4, 4):
+                            output_issues.append("prepared_sample_extrinsics_changed")
+                        prepared_metadata = raw_prepared.get("metadata", {})
+                        if prepared_metadata.get("normalization_mode") != cfg.normalization_mode:
+                            output_issues.append("prepared_sample_normalization_changed")
+                        if prepared_metadata.get("view_layout_version") != VIEW_LAYOUT_VERSION:
+                            output_issues.append("prepared_sample_view_layout_changed")
+                    except Exception as exc:  # noqa: BLE001
+                        output_issues.append(f"invalid_prepared_sample:{exc}")
                 if not output_issues:
                     logger.info("Skipping already valid model %s", file_id)
                     cached_manifest_row = dict(metrics["manifest_row"])
@@ -570,7 +646,11 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
             cleanup_reason = _post_cleanup_reason(clean.vertices, clean.faces, cfg)
             if cleanup_reason is not None:
                 raise RuntimeError(cleanup_reason)
-            gt_norm_v, norm = normalize_vertices(clean.vertices)
+            gt_norm_v, norm = normalize_vertices(
+                clean.vertices,
+                mode=cfg.normalization_mode,
+                epsilon=cfg.normalization_epsilon,
+            )
             gt_f = clean.faces.astype(np.int64)
 
             save_mesh_npz(out_dir / "gt_mesh.npz", gt_norm_v, gt_f)
@@ -609,9 +689,14 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 trajectory=cfg.views_trajectory,
                 min_elevation_degrees=-60.0,
                 max_elevation_degrees=60.0,
-                render_mode="lit",
+                fov_degrees=cfg.views_fov_degrees,
+                render_mode=cfg.views_render_mode,
                 backend=cfg.views_backend,
                 normalize_mesh=False,
+                opengl_context_backend=cfg.views_opengl_context_backend,
+                cube_half_extent=cfg.views_cube_half_extent,
+                antialiasing=cfg.views_antialiasing,
+                camera_layout_version=VIEW_LAYOUT_VERSION,
             )
             rendered = generate_configured_synthetic_dataset(
                 mesh=load_mesh(out_dir / "gt_mesh.obj"),
@@ -625,6 +710,7 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 raise RuntimeError("Rendered mesh does not match prepared normalized GT mesh")
             dataset_json = views_dir / "dataset.json"
             dataset = load_reconstruction_input(dataset_json)
+            render_metadata = json.loads(dataset_json.read_text(encoding="utf-8")).get("config", {})
             if len(dataset.image_paths) != cfg.views_count:
                 raise RuntimeError("Unexpected number of rendered views")
 
@@ -647,10 +733,25 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                     "file_id": int(file_id),
                     "split": id_to_split[file_id],
                     "normalization": norm,
+                    "normalization_mode": cfg.normalization_mode,
+                    "normalization_center": norm["normalization_center"],
+                    "normalization_scale": norm["normalization_scale"],
+                    "view_count": cfg.views_count,
+                    "view_trajectory": cfg.views_trajectory,
+                    "view_backend": cfg.views_backend,
+                    "opengl_context_backend": cfg.views_opengl_context_backend,
+                    "cube_half_extent": cfg.views_cube_half_extent,
+                    "fov_degrees": cfg.views_fov_degrees,
+                    "view_width": cfg.views_width,
+                    "view_height": cfg.views_height,
+                    "view_layout_version": VIEW_LAYOUT_VERSION,
+                    "view_names": list(CUBE_SURFACE_VIEW_NAMES),
+                    "prepared_storage_format": cfg.prepared_samples.storage_format,
                     "downstream_url": runtime.url,
                     "downstream_branch": runtime.branch,
                     "downstream_sha": runtime.sha,
                 },
+                dataset_root=output_root,
             )
             prepared_path = prepared_root / f"thingi10k_{file_id}.pt"
             save_prepared_sample(prepared, prepared_path)
@@ -680,12 +781,20 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 "coarse_faces": int(len(coarse.faces)),
                 "expanded_vertices": int(len(expanded.vertices)),
                 "expanded_faces": int(len(expanded.faces)),
-                "normalization_scale": float(norm["uniform_scale"]),
+                "normalization_scale": float(norm["normalization_scale"]),
+                "normalization_mode": cfg.normalization_mode,
                 "cleanup_operations": "|".join(cleanup_ops),
                 "subdivision_steps": cfg.subdivision_steps,
                 "laplacian_type": "uniform",
                 "views_count": cfg.views_count,
                 "views_resolution": f"{cfg.views_width}x{cfg.views_height}",
+                "views_trajectory": cfg.views_trajectory,
+                "views_backend": render_metadata.get("backend", cfg.views_backend),
+                "cube_half_extent": cfg.views_cube_half_extent,
+                "fov_degrees": cfg.views_fov_degrees,
+                "view_layout_version": VIEW_LAYOUT_VERSION,
+                "prepared_image_size": cfg.prepared_samples.image_size,
+                "prepared_storage_format": cfg.prepared_samples.storage_format,
                 "distance_mean": float(np.mean(dist)),
                 "distance_median": float(np.median(dist)),
                 "distance_p95": float(np.quantile(dist, 0.95)),
@@ -700,6 +809,15 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 "gt_metrics": _mesh_metrics(gt_norm_v, gt_f),
                 "coarse_metrics": _mesh_metrics(coarse.vertices, coarse.faces),
                 "expanded_metrics": _mesh_metrics(expanded.vertices, expanded.faces),
+                "geometry_contract": {
+                    "normalization_mode": cfg.normalization_mode,
+                    "normalization_epsilon": cfg.normalization_epsilon,
+                    "coarse_target_vertices": cfg.coarse_target_vertices,
+                    "coarse_min_vertices": cfg.coarse_min_vertices,
+                    "subdivision_steps": cfg.subdivision_steps,
+                    "target_constructor": "precomputed_closest_surface_on_prediction_graph",
+                    "laplacian_operator": "uniform",
+                },
                 "validation_status": "valid",
                 "manifest_row": manifest_row,
             }

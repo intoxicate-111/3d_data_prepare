@@ -124,25 +124,41 @@ def mesh_cleanup(vertices: np.ndarray, faces: np.ndarray) -> tuple[MeshArrays, l
     return MeshArrays(np.asarray(mesh.vertices), np.asarray(mesh.faces)), operations
 
 
-def normalize_vertices(vertices: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+def normalize_vertices(
+    vertices: np.ndarray,
+    mode: str = "unit_sphere_max_radius",
+    epsilon: float = 1e-12,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if mode != "unit_sphere_max_radius":
+        raise ValueError(f"Unsupported normalization mode: {mode}")
+    if epsilon <= 0:
+        raise ValueError("normalization epsilon must be positive")
     bounds_min = vertices.min(axis=0)
     bounds_max = vertices.max(axis=0)
     center = (bounds_min + bounds_max) * 0.5
-    extents = bounds_max - bounds_min
-    longest = float(np.max(extents))
-    scale = 2.0 / longest if longest > 0 else 1.0
-
-    normalized = (vertices - center) * scale
+    centered = np.asarray(vertices, dtype=np.float64) - center[None, :]
+    radius = float(np.linalg.norm(centered, axis=1).max())
+    scale = max(radius, epsilon)
+    normalized = centered / scale
+    max_radius = float(np.linalg.norm(normalized, axis=1).max())
+    if max_radius > 1.0 + 1e-6:
+        raise RuntimeError(f"Unit-sphere normalization failed: max_radius={max_radius}")
     nmin = normalized.min(axis=0)
     nmax = normalized.max(axis=0)
     transform = {
+        "normalization_mode": mode,
+        "normalization_center": center.tolist(),
+        "normalization_scale": scale,
+        "normalization_formula": "(V - center) / scale",
+        "normalization_epsilon": epsilon,
+        "normalized_max_radius": max_radius,
         "original_bounds_min": bounds_min.tolist(),
         "original_bounds_max": bounds_max.tolist(),
         "translation_center": center.tolist(),
-        "uniform_scale": scale,
+        "uniform_scale": 1.0 / scale,
         "normalized_bounds_min": nmin.tolist(),
         "normalized_bounds_max": nmax.tolist(),
-        "inverse": {"scale": 1.0 / scale if scale != 0 else 1.0, "translation_center": center.tolist()},
+        "inverse": {"scale": scale, "translation_center": center.tolist()},
     }
     return normalized.astype(np.float32), transform
 

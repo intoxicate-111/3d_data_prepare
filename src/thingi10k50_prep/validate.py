@@ -7,6 +7,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+import torch
+from PIL import Image
 
 from mlr.datasets import load_reconstruction_input
 from mlr.io import load_mesh
@@ -15,6 +17,7 @@ from mlr.learned_laplacian.dataset import load_prepared_sample
 from mlr.learned_laplacian.multi_dataset import PreparedMeshDataset, validate_disjoint_splits
 
 from .io_utils import write_csv
+from .rendering import CUBE_SURFACE_VIEW_NAMES
 
 
 def _load_npz_mesh(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -66,6 +69,11 @@ def validate_dataset(data_root: str | Path) -> None:
 
             if np.max(np.abs(gt_v)) > 1.01:
                 issues.append("normalized_gt_out_of_expected_range")
+            radii = np.linalg.norm(gt_v, axis=1)
+            if radii.max() > 1.0 + 1e-6:
+                issues.append("normalized_gt_outside_unit_sphere")
+            if radii.max() < 1.0 - 1e-5:
+                issues.append("normalized_gt_does_not_reach_unit_sphere")
 
             targets = np.load(model_dir / "targets.npz")
             lap = sp.load_npz(model_dir / "laplacian.npz")
@@ -116,6 +124,42 @@ def validate_dataset(data_root: str | Path) -> None:
                 expected_views = int(manifest.loc[manifest["file_id"] == file_id, "views_count"].iloc[0])
                 if len(dataset.image_paths) != expected_views:
                     issues.append("unexpected_view_count")
+                if expected_views == 14:
+                    half_extent = float(
+                        manifest.loc[manifest["file_id"] == file_id, "cube_half_extent"].iloc[0]
+                    )
+                    a = half_extent
+                    expected_centers = np.asarray([
+                        (a, 0, 0), (-a, 0, 0), (0, a, 0), (0, -a, 0),
+                        (0, 0, a), (0, 0, -a),
+                        (-a, -a, -a), (-a, -a, a), (-a, a, -a), (-a, a, a),
+                        (a, -a, -a), (a, -a, a), (a, a, -a), (a, a, a),
+                    ], dtype=np.float64)
+                    actual_centers = np.stack([-camera.rotation.T @ camera.translation for camera in dataset.cameras])
+                    if not np.allclose(actual_centers, expected_centers, atol=1e-8, rtol=0.0):
+                        issues.append("cube_camera_centers_mismatch")
+                    if tuple(camera.name for camera in dataset.cameras) != CUBE_SURFACE_VIEW_NAMES:
+                        issues.append("cube_camera_order_mismatch")
+                    expected_forward = -actual_centers / np.linalg.norm(actual_centers, axis=1, keepdims=True)
+                    actual_forward = np.stack([camera.rotation[2] for camera in dataset.cameras])
+                    if not np.allclose(actual_forward, expected_forward, atol=1e-8, rtol=0.0):
+                        issues.append("cube_camera_orientation_mismatch")
+                for view_index, (image_path, mask_path, depth_path) in enumerate(zip(
+                    dataset.image_paths, dataset.mask_paths, dataset.depth_paths, strict=True
+                )):
+                    image = np.asarray(Image.open(image_path).convert("RGB"))
+                    mask = np.asarray(Image.open(mask_path)) > 0
+                    depth_image = np.load(depth_path)
+                    if not np.any(mask):
+                        issues.append(f"empty_mask:view_{view_index}")
+                        continue
+                    if np.any(mask[0]) or np.any(mask[-1]) or np.any(mask[:, 0]) or np.any(mask[:, -1]):
+                        issues.append(f"mask_touches_image_border:view_{view_index}")
+                    if not np.any(image[mask]):
+                        issues.append(f"black_foreground:view_{view_index}")
+                    foreground_depth = depth_image[mask]
+                    if not np.isfinite(foreground_depth).all() or np.any(foreground_depth <= 0):
+                        issues.append(f"invalid_foreground_depth:view_{view_index}")
                 if not (model_dir / "views" / "cameras.json").exists():
                     issues.append("missing_cameras_json")
                 if not (model_dir / "views" / "mesh.obj").exists():
@@ -135,7 +179,17 @@ def validate_dataset(data_root: str | Path) -> None:
             if not np.allclose(delta, expected_delta, rtol=0.0, atol=2e-7):
                 issues.append("laplacian_target_contract_mismatch")
 
-            prepared = load_prepared_sample(root / "prepared" / f"thingi10k_{file_id}.pt")
+            prepared_path = root / "prepared" / f"thingi10k_{file_id}.pt"
+            raw_prepared = torch.load(prepared_path, map_location="cpu", weights_only=False)
+            if "images" in raw_prepared:
+                issues.append("raw_prepared_sample_embeds_images")
+            if raw_prepared.get("prepared_storage_format") != "lazy_image_paths_v1":
+                issues.append("unexpected_prepared_storage_format")
+            if len(raw_prepared.get("image_paths", [])) != 14:
+                issues.append("unexpected_lazy_image_path_count")
+            prepared = load_prepared_sample(prepared_path)
+            if tuple(prepared["images"].shape[:2]) != (14, 3):
+                issues.append("lazy_loaded_image_shape_mismatch")
             required_extra = (
                 "raw_laplacian_target", "normalized_laplacian_target", "valid_scale_mask",
                 "local_edge_length", "local_edge_scale", "target_positions", "gt_vertices", "gt_faces",
