@@ -16,12 +16,12 @@ strata:
   - name: "all"
     min_faces: 200
     max_faces: 20000000
-    count: 1000
+    count: 5000
 
 split:
-  train: 800
-  val: 100
-  test: 100
+  train: 4000
+  val: 500
+  test: 500
 
 normalization:
   mode: "aabb_center_longest_to_2"
@@ -34,9 +34,11 @@ subdivision:
   steps: 1
 
 views:
-  count: 16
+  count: 14
   width: 1920
   height: 1920
+  backend: "cuda"
+  trajectory: "cube"
 
 downstream:
   repo_url: "https://github.com/intoxicate-111/multiview-laplacian-refinement.git"

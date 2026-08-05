@@ -6,7 +6,7 @@ from .config import load_config
 
 
 def prepare_main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare 50-model Thingi10K dataset")
+    parser = argparse.ArgumentParser(description="Prepare a YAML-configured Thingi10K dataset")
     parser.add_argument("--config", default="configs/thingi10k50.yaml")
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -25,7 +25,7 @@ def prepare_main() -> None:
 
 
 def validate_main() -> None:
-    parser = argparse.ArgumentParser(description="Validate prepared Thingi10K50 dataset")
+    parser = argparse.ArgumentParser(description="Validate a prepared Thingi10K dataset")
     parser.add_argument("--data-root", default="data/thingi10k50")
     parser.add_argument("--config", default="configs/thingi10k50.yaml")
     args = parser.parse_args()
@@ -38,7 +38,7 @@ def validate_main() -> None:
 
 
 def smoke_main() -> None:
-    parser = argparse.ArgumentParser(description="Run data smoke test on prepared Thingi10k50")
+    parser = argparse.ArgumentParser(description="Run a data smoke test on prepared Thingi10K data")
     parser.add_argument("--data-root", default="data/thingi10k50")
     parser.add_argument("--config", default="configs/thingi10k50.yaml")
     args = parser.parse_args()

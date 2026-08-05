@@ -1,2 +1,1 @@
-"""Thingi10K50 dataset preparation package."""
-
+"""YAML-configured Thingi10K dataset preparation package."""

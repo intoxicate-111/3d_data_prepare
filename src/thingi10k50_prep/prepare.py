@@ -29,6 +29,7 @@ from .mesh_ops import (
     normalize_vertices,
     simplify_mesh,
 )
+from .rendering import generate_configured_synthetic_dataset
 
 
 def _entry_int(entry: dict[str, Any], keys: tuple[str, ...], default: int = -1) -> int:
@@ -188,13 +189,29 @@ def _candidate_reason(vertices: np.ndarray, faces: np.ndarray, cfg: PrepareConfi
         return "below_minimum_complexity"
     if len(faces) > cfg.max_faces:
         return "too_many_faces"
+    return None
+
+
+def _post_cleanup_reason(vertices: np.ndarray, faces: np.ndarray, cfg: PrepareConfig) -> str | None:
+    if vertices.size == 0 or faces.size == 0:
+        return "empty_vertices_or_faces_after_cleanup"
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        return "invalid_vertex_shape_after_cleanup"
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        return "non_triangle_faces_after_cleanup"
+    if not np.isfinite(vertices).all():
+        return "non_finite_vertices_after_cleanup"
+    if np.min(faces) < 0 or np.max(faces) >= len(vertices):
+        return "invalid_face_indices_after_cleanup"
     repeated_idx = (faces[:, 0] == faces[:, 1]) | (faces[:, 1] == faces[:, 2]) | (faces[:, 0] == faces[:, 2])
     if np.any(repeated_idx):
-        return "repeated_indices_in_face"
+        return "repeated_indices_in_face_after_cleanup"
     tri = vertices[faces]
     area = np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1) * 0.5
     if np.any(area <= 0):
-        return "non_positive_triangle_area"
+        return "non_positive_triangle_area_after_cleanup"
+    if len(vertices) < cfg.min_vertices or len(faces) < cfg.min_faces:
+        return "below_minimum_complexity_after_cleanup"
     return None
 
 
@@ -217,90 +234,207 @@ def _expected_model_count(cfg: PrepareConfig) -> int:
 
     return stratum_total
 
+
+def _group_key(row: dict[str, Any]) -> tuple[str, int]:
+    thing_id = int(row.get("thing_id", -1))
+    if thing_id > 0:
+        return ("thing", thing_id)
+    return ("file", int(row["file_id"]))
+
+
 def _sample_stratified(valid_rows: list[dict[str, Any]], cfg: PrepareConfig) -> list[dict[str, Any]]:
-    random.seed(cfg.seed)
+    rng = random.Random(cfg.seed)
     by_stratum: dict[str, list[dict[str, Any]]] = {s.name: [] for s in cfg.strata}
     for row in valid_rows:
-        by_stratum[row["stratum"]].append(row)
+        if row["stratum"] in by_stratum:
+            by_stratum[row["stratum"]].append(row)
+
+    target_count = _expected_model_count(cfg)
+    candidate_counts = {name: len(rows) for name, rows in by_stratum.items()}
+    if len(valid_rows) < target_count or any(candidate_counts[s.name] < s.count for s in cfg.strata):
+        raise RuntimeError(
+            "Insufficient candidates for stratified sampling: "
+            f"target_count={target_count}, valid_rows={len(valid_rows)}, "
+            f"stratum_candidates={candidate_counts}"
+        )
 
     selected: list[dict[str, Any]] = []
-    used_things: set[int] = set()
+    selected_ids: set[int] = set()
+    used_positive_things: set[int] = set()
+    remaining_by_stratum: dict[str, list[dict[str, Any]]] = {}
+
+    # First pass: satisfy each stratum with as many distinct positive thing IDs
+    # as possible. Missing/non-positive thing IDs are independent file groups.
     for s in cfg.strata:
         pool = by_stratum[s.name].copy()
-        random.shuffle(pool)
+        rng.shuffle(pool)
         pick: list[dict[str, Any]] = []
         for row in pool:
+            file_id = int(row["file_id"])
+            if file_id in selected_ids:
+                continue
             thing_id = int(row.get("thing_id", -1))
-            if thing_id > 0 and thing_id in used_things:
+            if thing_id > 0 and thing_id in used_positive_things:
                 continue
             pick.append(row)
+            selected_ids.add(file_id)
             if thing_id > 0:
-                used_things.add(thing_id)
+                used_positive_things.add(thing_id)
             if len(pick) == s.count:
                 break
         selected.extend(pick)
+        remaining_by_stratum[s.name] = pool
 
-    target_count = _expected_model_count(cfg)
-
-    if len(selected) < target_count:
-        remaining = [r for r in valid_rows if r["file_id"] not in {x["file_id"] for x in selected}]
-        random.shuffle(remaining)
-        for row in remaining:
-            thing_id = int(row.get("thing_id", -1))
-            if thing_id > 0 and thing_id in used_things:
+    # Second pass: fill each stratum quota with other file IDs, even when their
+    # positive thing ID has already been represented.
+    for s in cfg.strata:
+        current = sum(1 for row in selected if row["stratum"] == s.name)
+        for row in remaining_by_stratum[s.name]:
+            if current == s.count:
+                break
+            file_id = int(row["file_id"])
+            if file_id in selected_ids:
                 continue
             selected.append(row)
-            if thing_id > 0:
-                used_things.add(thing_id)
-            if len(selected) == target_count:
-                break
+            selected_ids.add(file_id)
+            current += 1
 
     if len(selected) != target_count:
         raise RuntimeError(
-            f"Unable to sample {target_count} models; "
-            f"got {len(selected)} valid selections"
+            "Unable to satisfy stratified sampling exactly: "
+            f"target_count={target_count}, selected={len(selected)}, "
+            f"valid_rows={len(valid_rows)}, stratum_candidates={candidate_counts}"
         )
     return selected
 
+
+def _assert_group_aware_split(split: dict[str, list[int]], rows_by_id: dict[int, dict[str, Any]]) -> None:
+    expected_names = ("train", "validation", "test")
+    id_sets = {name: set(split[name]) for name in expected_names}
+    if any(id_sets[a] & id_sets[b] for i, a in enumerate(expected_names) for b in expected_names[i + 1 :]):
+        raise RuntimeError("Split file IDs are not mutually exclusive")
+
+    positive_things = {
+        name: {
+            int(rows_by_id[file_id].get("thing_id", -1))
+            for file_id in ids
+            if int(rows_by_id[file_id].get("thing_id", -1)) > 0
+        }
+        for name, ids in id_sets.items()
+    }
+    if any(
+        positive_things[a] & positive_things[b]
+        for i, a in enumerate(expected_names)
+        for b in expected_names[i + 1 :]
+    ):
+        raise RuntimeError("Positive thing_id leakage detected between splits")
+
+    for name in ("validation", "test"):
+        ids = [
+            int(rows_by_id[file_id].get("thing_id", -1))
+            for file_id in split[name]
+            if int(rows_by_id[file_id].get("thing_id", -1)) > 0
+        ]
+        if len(ids) != len(set(ids)):
+            raise RuntimeError(f"Split {name} contains more than one file for a positive thing_id")
+
+
 def _make_split(selected: list[dict[str, Any]], cfg: PrepareConfig) -> dict[str, list[int]]:
-    random.seed(cfg.seed)
-    shuffled = selected.copy()
-    random.shuffle(shuffled)
-    train = [int(x["file_id"]) for x in shuffled[: cfg.split.train]]
-    val = [int(x["file_id"]) for x in shuffled[cfg.split.train : cfg.split.train + cfg.split.val]]
-    test = [int(x["file_id"]) for x in shuffled[cfg.split.train + cfg.split.val :]]
-    return {"train": train, "validation": val, "test": test}
+    expected_total = _expected_model_count(cfg)
+    if len(selected) != expected_total:
+        raise RuntimeError(f"Split input must contain exactly {expected_total} rows, found {len(selected)}")
+
+    rng = random.Random(cfg.seed)
+    groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for row in selected:
+        groups.setdefault(_group_key(row), []).append(row)
+
+    ranked_groups = list(groups.items())
+    rng.shuffle(ranked_groups)
+    ranked_groups.sort(key=lambda item: len(item[1]))
+    held_out_count = cfg.split.val + cfg.split.test
+    if len(ranked_groups) < held_out_count:
+        raise RuntimeError(
+            "Unable to construct group-aware split: "
+            f"available_groups={len(ranked_groups)}, available_train_files=0, "
+            f"required_train={cfg.split.train}, required_validation={cfg.split.val}, "
+            f"required_test={cfg.split.test}"
+        )
+
+    held_out_groups = ranked_groups[:held_out_count]
+    train_groups = ranked_groups[held_out_count:]
+    available_train_files = sum(len(rows) for _, rows in train_groups)
+    if available_train_files < cfg.split.train:
+        raise RuntimeError(
+            "Unable to construct exact group-aware split without thing_id leakage: "
+            f"available_groups={len(ranked_groups)}, "
+            f"available_train_files={available_train_files}, "
+            f"required_train={cfg.split.train}, required_validation={cfg.split.val}, "
+            f"required_test={cfg.split.test}"
+        )
+
+    held_out_rows = [rows[0] for _, rows in held_out_groups]
+    validation = [int(row["file_id"]) for row in held_out_rows[: cfg.split.val]]
+    test = [int(row["file_id"]) for row in held_out_rows[cfg.split.val :]]
+    train_pool = [row for _, rows in train_groups for row in rows]
+    rng.shuffle(train_pool)
+    train = [int(row["file_id"]) for row in train_pool[: cfg.split.train]]
+    split = {"train": train, "validation": validation, "test": test}
+    _assert_group_aware_split(split, {int(row["file_id"]): row for row in selected})
+    return split
 
 
 def _replacement_candidate(
-    failed: dict[str, Any], valid_rows: list[dict[str, Any]], selected_ids: set[int],
-    used_thing_ids: set[int], current_scan_index: int,
+    failed: dict[str, Any], failed_split: str, valid_rows: list[dict[str, Any]],
+    selected_by_id: dict[int, dict[str, Any]], id_to_split: dict[int, str], current_scan_index: int,
 ) -> dict[str, Any] | None:
-    """Pick a deterministic later candidate, preferring the failed slot's stratum."""
+    """Pick a deterministic later candidate that preserves split group isolation."""
+    positive_things_by_split = {
+        name: {
+            int(selected_by_id[file_id].get("thing_id", -1))
+            for file_id, split_name in id_to_split.items()
+            if split_name == name and int(selected_by_id[file_id].get("thing_id", -1)) > 0
+        }
+        for name in ("train", "validation", "test")
+    }
+
+    def group_is_allowed(row: dict[str, Any]) -> bool:
+        thing_id = int(row.get("thing_id", -1))
+        if thing_id <= 0:
+            return True
+        if failed_split == "train":
+            return thing_id not in positive_things_by_split["validation"] | positive_things_by_split["test"]
+        other_splits = {"train", "validation", "test"} - {failed_split}
+        return all(thing_id not in positive_things_by_split[name] for name in other_splits) and thing_id not in positive_things_by_split[failed_split]
+
     eligible = [
         row for row in valid_rows
-        if int(row["file_id"]) not in selected_ids
+        if int(row["file_id"]) not in selected_by_id
         and int(row.get("scan_index", -1)) > current_scan_index
-        and (int(row.get("thing_id", -1)) <= 0 or int(row["thing_id"]) not in used_thing_ids)
+        and group_is_allowed(row)
     ]
     preferred = [row for row in eligible if row["stratum"] == failed["stratum"]]
-    pool = preferred or eligible
+    pool = preferred
     if not pool:
         return None
     return min(pool, key=lambda row: (int(row["scan_index"]), int(row["file_id"])))
 
 
 def prepare_dataset(cfg: PrepareConfig) -> None:
+    expected_count = _expected_model_count(cfg)
     runtime = validate_downstream(cfg.downstream)
     from mlr.datasets import load_reconstruction_input
     from mlr.io import load_mesh
     from mlr.learned_laplacian.dataset import save_prepared_sample, validate_sample
-    from mlr.synthetic import SyntheticRenderConfig, generate_synthetic_dataset
+    from mlr.synthetic import SyntheticRenderConfig
 
     output_root = Path(cfg.output_root)
     ensure_dir(output_root)
     logger = setup_logger(output_root / cfg.log_file)
-    logger.info("Starting Thingi10K50 preparation")
+    logger.info(
+        "Starting preparation for %s models (train=%s, validation=%s, test=%s)",
+        expected_count, cfg.split.train, cfg.split.val, cfg.split.test,
+    )
     _write_contract_report(output_root, runtime)
 
     thingi10k.init(variant="npz", cache_dir=cfg.cache_dir)
@@ -366,8 +500,10 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
 
     id_to_split = {fid: s for s, ids in split.items() for fid in ids}
     selected_by_id = {int(row["file_id"]): row for row in selected}
-    logger.info("Processing selected models")
-    used_thing_ids = {int(row["thing_id"]) for row in selected if int(row.get("thing_id", -1)) > 0}
+    logger.info(
+        "Processing %s selected models (train=%s, validation=%s, test=%s)",
+        expected_count, cfg.split.train, cfg.split.val, cfg.split.test,
+    )
     for scan_index, entry in enumerate(tqdm(dataset_entries, desc="Preparing models")):
         file_id = _entry_int(entry, ("file_id", "id", "model_id"))
         if file_id not in selected_by_id:
@@ -389,11 +525,30 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 prepared_path = prepared_root / f"thingi10k_{file_id}.pt"
                 if not views_dataset.exists():
                     output_issues.append("missing_views_dataset")
+                else:
+                    try:
+                        reconstruction = load_reconstruction_input(views_dataset)
+                        render_metadata = json.loads(views_dataset.read_text(encoding="utf-8")).get("config", {})
+                        if len(reconstruction.image_paths) != cfg.views_count:
+                            output_issues.append("unexpected_view_count")
+                        if render_metadata.get("trajectory") != cfg.views_trajectory:
+                            output_issues.append("unexpected_view_trajectory")
+                        if render_metadata.get("backend") != cfg.views_backend:
+                            output_issues.append("unexpected_render_backend")
+                        if (
+                            render_metadata.get("width") != cfg.views_width
+                            or render_metadata.get("height") != cfg.views_height
+                        ):
+                            output_issues.append("unexpected_view_resolution")
+                    except Exception as exc:  # noqa: BLE001
+                        output_issues.append(f"invalid_views_dataset:{exc}")
                 if not prepared_path.exists():
                     output_issues.append("missing_prepared_sample")
                 if not output_issues:
                     logger.info("Skipping already valid model %s", file_id)
-                    manifest_rows.append(metrics["manifest_row"])
+                    cached_manifest_row = dict(metrics["manifest_row"])
+                    cached_manifest_row["split"] = id_to_split[file_id]
+                    manifest_rows.append(cached_manifest_row)
                     prepared_records.append(
                         {"path": str(prepared_path.relative_to(output_root)), "split": id_to_split[file_id],
                          "sample_id": f"thingi10k_{file_id}"}
@@ -412,6 +567,9 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
             write_json(out_dir / "source_metadata.json", entry)
 
             clean, cleanup_ops = mesh_cleanup(source_v, source_f)
+            cleanup_reason = _post_cleanup_reason(clean.vertices, clean.faces, cfg)
+            if cleanup_reason is not None:
+                raise RuntimeError(cleanup_reason)
             gt_norm_v, norm = normalize_vertices(clean.vertices)
             gt_f = clean.faces.astype(np.int64)
 
@@ -448,14 +606,14 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 num_views=cfg.views_count,
                 width=cfg.views_width,
                 height=cfg.views_height,
-                trajectory="sphere",
+                trajectory=cfg.views_trajectory,
                 min_elevation_degrees=-60.0,
                 max_elevation_degrees=60.0,
                 render_mode="lit",
-                backend="cpu",
+                backend=cfg.views_backend,
                 normalize_mesh=False,
             )
-            rendered = generate_synthetic_dataset(
+            rendered = generate_configured_synthetic_dataset(
                 mesh=load_mesh(out_dir / "gt_mesh.obj"),
                 out_dir=views_dir,
                 config=render_cfg,
@@ -549,20 +707,35 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
             manifest_rows.append(manifest_row)
         except Exception as exc:  # noqa: BLE001
             failed_rows.append({"file_id": file_id, "reason": f"processing_failure: {exc}"})
+            prepared_records = [
+                record for record in prepared_records
+                if record.get("sample_id") != f"thingi10k_{file_id}"
+            ]
+            manifest_rows = [row for row in manifest_rows if int(row["file_id"]) != file_id]
             failed_row = selected_by_id[file_id]
+            failed_split = id_to_split.pop(file_id)
+            split[failed_split].remove(file_id)
+            selected_by_id.pop(file_id)
             replacement = _replacement_candidate(
-                failed_row, valid_rows, set(selected_by_id), used_thing_ids, scan_index
+                failed_row, failed_split, valid_rows, selected_by_id, id_to_split, scan_index
             )
             if replacement is not None:
-                failed_split = id_to_split.pop(file_id)
-                split[failed_split].remove(file_id)
                 replacement_id = int(replacement["file_id"])
                 split[failed_split].append(replacement_id)
                 id_to_split[replacement_id] = failed_split
                 selected_by_id[replacement_id] = replacement
-                replacement_thing = int(replacement.get("thing_id", -1))
-                if replacement_thing > 0:
-                    used_thing_ids.add(replacement_thing)
+                _assert_group_aware_split(split, selected_by_id)
+                actual_counts = {name: len(ids) for name, ids in split.items()}
+                required_counts = {
+                    "train": cfg.split.train,
+                    "validation": cfg.split.val,
+                    "test": cfg.split.test,
+                }
+                if actual_counts != required_counts:
+                    raise RuntimeError(
+                        "Replacement changed exact split counts: "
+                        f"required={required_counts}, actual={actual_counts}"
+                    )
                 logger.warning(
                     "Replacing failed model %s with %s in split %s", file_id, replacement_id, failed_split
                 )
@@ -570,13 +743,28 @@ def prepare_dataset(cfg: PrepareConfig) -> None:
                 logger.error("No eligible later replacement for failed model %s", file_id)
             write_csv(output_root / "failed_models.csv", failed_rows)
 
-    expected_count = _expected_model_count(cfg)
-
     if len(manifest_rows) != expected_count:
         raise RuntimeError(
             f"Expected {expected_count} prepared models, "
             f"got {len(manifest_rows)}"
         )
+    if len(prepared_records) != expected_count:
+        raise RuntimeError(
+            f"Expected {expected_count} prepared manifest records, got {len(prepared_records)}"
+        )
+
+    required_split_counts = {
+        "train": cfg.split.train,
+        "validation": cfg.split.val,
+        "test": cfg.split.test,
+    }
+    actual_split_counts = {name: len(ids) for name, ids in split.items()}
+    if actual_split_counts != required_split_counts:
+        raise RuntimeError(
+            "Final split counts do not match config: "
+            f"required={required_split_counts}, actual={actual_split_counts}"
+        )
+    _assert_group_aware_split(split, selected_by_id)
 
     write_csv(output_root / "manifest.csv", manifest_rows)
     write_json(output_root / "manifest.json", manifest_rows)
@@ -615,6 +803,8 @@ def _write_preparation_report(
         f"- Candidates rejected: `{len(rejected_rows)}`\n"
         f"- Model failures: `{len(failed_rows)}`\n"
         f"- Final models: `{len(manifest_rows)}`\n"
+        f"- Configured models: `{_expected_model_count(cfg)}`\n"
+        f"- Split counts: `train={cfg.split.train}, validation={cfg.split.val}, test={cfg.split.test}`\n"
         f"- Projection distance mean over models: `{float(np.mean(distances)):.6f}`\n"
         f"- Projection distance worst mean: `{float(np.max(distances)):.6f}`\n"
     )

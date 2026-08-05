@@ -163,24 +163,92 @@ def validate_dataset(data_root: str | Path) -> None:
         raise RuntimeError(f"Validation failed for {len(invalid)} models")
 
     split = json.loads((root / "split.json").read_text(encoding="utf-8"))
-
+    if "val" in split:
+        split["validation"] = split.pop("val")
     split_names = ("train", "validation", "test")
+    missing_splits = [name for name in split_names if name not in split]
+    if missing_splits:
+        raise RuntimeError(f"split.json is missing required splits: {missing_splits}")
 
-    expected_split_counts = {
-        name: len(split[name])
-        for name in split_names
-    }
+    split_id_sets = {name: {int(file_id) for file_id in split[name]} for name in split_names}
+    if any(
+        split_id_sets[a] & split_id_sets[b]
+        for i, a in enumerate(split_names)
+        for b in split_names[i + 1 :]
+    ):
+        raise RuntimeError("split.json file IDs are not mutually exclusive")
 
+    expected_split_counts = {name: len(split[name]) for name in split_names}
     expected_total = sum(expected_split_counts.values())
-
     if len(manifest) != expected_total:
         raise RuntimeError(
-            f"Expected {expected_total} manifest rows, "
-            f"found {len(manifest)}"
+            f"Manifest count does not match split.json: expected={expected_total}, found={len(manifest)}"
         )
 
+    manifest_ids = manifest["file_id"].astype(int)
+    if manifest_ids.duplicated().any():
+        raise RuntimeError("Prepared manifest.csv contains duplicate file_id values")
+    split_ids = set().union(*split_id_sets.values())
+    if set(manifest_ids.tolist()) != split_ids:
+        raise RuntimeError(
+            "manifest.csv file IDs do not match split.json: "
+            f"manifest_only={sorted(set(manifest_ids.tolist()) - split_ids)}, "
+            f"split_only={sorted(split_ids - set(manifest_ids.tolist()))}"
+        )
+
+    manifest_split_by_id = {
+        int(row.file_id): ("validation" if str(row.split) == "val" else str(row.split))
+        for row in manifest.itertuples()
+    }
+    for split_name, file_ids in split_id_sets.items():
+        mismatched = [file_id for file_id in file_ids if manifest_split_by_id[file_id] != split_name]
+        if mismatched:
+            raise RuntimeError(
+                f"manifest.csv split labels disagree with split.json for {split_name}: {mismatched}"
+            )
+
+    positive_things_by_split: dict[str, list[int]] = {name: [] for name in split_names}
+    for row in manifest.itertuples():
+        raw_thing_id = getattr(row, "thing_id", -1)
+        if pd.isna(raw_thing_id):
+            continue
+        try:
+            thing_id = int(raw_thing_id)
+        except (TypeError, ValueError):
+            continue
+        if thing_id > 0:
+            positive_things_by_split[manifest_split_by_id[int(row.file_id)]].append(thing_id)
+    if any(
+        set(positive_things_by_split[a]) & set(positive_things_by_split[b])
+        for i, a in enumerate(split_names)
+        for b in split_names[i + 1 :]
+    ):
+        raise RuntimeError("Positive thing_id leakage detected between train/validation/test")
+    for split_name in ("validation", "test"):
+        ids = positive_things_by_split[split_name]
+        if len(ids) != len(set(ids)):
+            raise RuntimeError(f"Split {split_name} contains multiple files for a positive thing_id")
 
     prepared_manifest = root / "prepared_manifest.json"
+    prepared_payload = json.loads(prepared_manifest.read_text(encoding="utf-8"))
+    prepared_records = prepared_payload.get("samples", [])
+    if len(prepared_records) != expected_total:
+        raise RuntimeError(
+            "Prepared manifest count does not match split.json: "
+            f"expected={expected_total}, found={len(prepared_records)}"
+        )
+    prepared_split_counts = {
+        name: sum(
+            1 for record in prepared_records
+            if ("validation" if record.get("split") == "val" else record.get("split")) == name
+        )
+        for name in split_names
+    }
+    if prepared_split_counts != expected_split_counts:
+        raise RuntimeError(
+            "Prepared manifest split counts do not match split.json: "
+            f"expected={expected_split_counts}, actual={prepared_split_counts}"
+        )
 
     datasets = [
         PreparedMeshDataset.from_manifest(

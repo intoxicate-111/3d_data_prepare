@@ -58,6 +58,8 @@ class PrepareConfig:
     views_count: int
     views_width: int
     views_height: int
+    views_backend: str
+    views_trajectory: str
     downstream: DownstreamConfig
     prepared_samples: PreparedSampleConfig
 
@@ -90,6 +92,8 @@ def load_config(path: str | Path) -> PrepareConfig:
         views_count=int(raw["views"]["count"]),
         views_width=int(raw["views"]["width"]),
         views_height=int(raw["views"]["height"]),
+        views_backend=str(raw["views"].get("backend", "cuda")),
+        views_trajectory=str(raw["views"].get("trajectory", "sphere")),
         downstream=downstream,
         prepared_samples=prepared_samples,
     )

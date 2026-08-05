@@ -12,16 +12,14 @@ from tqdm import tqdm
 from .config import load_config
 from .downstream import validate_downstream
 from .io_utils import ensure_dir, write_csv, write_json
-from .prepare import _build_prepared_sample, _write_contract_report
+from .prepare import _build_prepared_sample, _expected_model_count, _write_contract_report
+from .rendering import generate_configured_synthetic_dataset
 
 
 def finalize_cached_dataset(config_path: str | Path) -> None:
     cfg = load_config(config_path)
 
-    expected_total = sum(
-        stratum.count
-        for stratum in cfg.strata
-    )
+    expected_total = _expected_model_count(cfg)
 
     expected_split_counts = {
         "train": cfg.split.train,
@@ -29,22 +27,11 @@ def finalize_cached_dataset(config_path: str | Path) -> None:
         "test": cfg.split.test,
     }
 
-    configured_split_total = sum(
-        expected_split_counts.values()
-    )
-
-    if expected_total != configured_split_total:
-        raise ValueError(
-            "Stratum and split totals must match: "
-            f"strata={expected_total}, "
-            f"split={configured_split_total}"
-        )
-
     runtime = validate_downstream(cfg.downstream)
     from mlr.datasets import load_reconstruction_input
     from mlr.io import load_mesh
     from mlr.learned_laplacian.dataset import load_prepared_sample, save_prepared_sample
-    from mlr.synthetic import SyntheticRenderConfig, generate_synthetic_dataset
+    from mlr.synthetic import SyntheticRenderConfig
 
     root = Path(cfg.output_root)
     manifest = pd.read_csv(root / "manifest.csv")
@@ -77,8 +64,8 @@ def finalize_cached_dataset(config_path: str | Path) -> None:
     failures: list[dict[str, object]] = []
     render_cfg = SyntheticRenderConfig(
         num_views=cfg.views_count, width=cfg.views_width, height=cfg.views_height,
-        trajectory="sphere", min_elevation_degrees=-60.0, max_elevation_degrees=60.0,
-        render_mode="lit", backend="cpu", normalize_mesh=False,
+        trajectory=cfg.views_trajectory, min_elevation_degrees=-60.0, max_elevation_degrees=60.0,
+        render_mode="lit", backend=cfg.views_backend, normalize_mesh=False,
     )
     for source_row in tqdm(manifest.to_dict(orient="records"), desc="Finalizing cached models"):
         file_id = int(source_row["file_id"])
@@ -91,13 +78,16 @@ def finalize_cached_dataset(config_path: str | Path) -> None:
                 try:
                     existing = load_reconstruction_input(dataset_json)
                     needs_render = len(existing.image_paths) != cfg.views_count
+                    render_metadata = json.loads(dataset_json.read_text(encoding="utf-8")).get("config", {})
+                    needs_render = needs_render or render_metadata.get("trajectory") != cfg.views_trajectory
+                    needs_render = needs_render or render_metadata.get("backend") != cfg.views_backend
                     if not needs_render and existing.image_paths:
                         from PIL import Image
                         needs_render = Image.open(existing.image_paths[0]).size != (cfg.views_width, cfg.views_height)
                 except Exception:  # noqa: BLE001
                     needs_render = True
             if needs_render:
-                generate_synthetic_dataset(
+                generate_configured_synthetic_dataset(
                     load_mesh(model_dir / "gt_mesh.obj"), views_dir, render_cfg,
                     source_mesh_path=model_dir / "gt_mesh.obj",
                 )
