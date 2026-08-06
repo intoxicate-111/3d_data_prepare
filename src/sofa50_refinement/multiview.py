@@ -4,7 +4,9 @@ import copy
 import gc
 import hashlib
 import json
+import multiprocessing
 import sys
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ RENDER_SPEC = {
     "camera_layout_version": "unit_sphere_cube_surface_faces6_corners8_v1",
     "camera_convention": "right-handed CV world-to-camera, +Z forward, +X right, +Y down",
 }
+_WORKER_DEPS: dict[str, Any] | None = None
 
 
 def prepare_multiview_dataset(
@@ -32,8 +35,11 @@ def prepare_multiview_dataset(
     backend: str = "opengl",
     force: bool = False,
     expected_count: int = 2,
+    dataset_name: str = "sofa50",
+    full_forward_validation: bool = True,
+    workers: int = 1,
 ) -> dict[str, Any]:
-    """Render and validate a two-sample trial or the complete Sofa50 dataset.
+    """Render and validate a two-sample trial or a complete prepared mesh dataset.
 
     Rendering and prepared-sample construction deliberately use the downstream
     repository implementation. Geometry files below ``refinement_root/models`` are only
@@ -47,36 +53,65 @@ def prepare_multiview_dataset(
     source_manifest_path = refinement_root / "manifest.json"
     source_manifest = _read_json(source_manifest_path)
     samples = [item for item in source_manifest.get("samples", []) if item.get("status") == "valid"]
-    if expected_count not in {2, 50}:
-        raise ValueError("expected_count must be 2 for trial or 50 for full generation")
+    if expected_count < 1:
+        raise ValueError("expected_count must be positive")
+    dataset_name = dataset_name.strip().lower().replace("-", "_")
+    if not dataset_name or not all(char.isalnum() or char == "_" for char in dataset_name):
+        raise ValueError("dataset_name must contain only letters, numbers, and underscores")
     if len(samples) != expected_count:
         raise ValueError(
-            f"Expected exactly {expected_count} valid Sofa50 samples, found {len(samples)}."
+            f"Expected exactly {expected_count} valid {dataset_name} samples, found {len(samples)}."
         )
     if backend not in {"cpu", "opengl", "cuda"}:
         raise ValueError("backend must be cpu, opengl, or cuda")
+    if workers < 1:
+        raise ValueError("workers must be positive")
 
     output_root.mkdir(parents=True, exist_ok=True)
     records: list[dict[str, Any]] = []
     geometry_hashes_before = _geometry_hashes(samples)
-    for index, item in enumerate(samples, start=1):
-        model_id = str(item["model_id"])
-        split = str(item["split"])
-        print(
-            f"[{index}/{expected_count}] preparing formal GT renders for {model_id}",
-            flush=True,
-        )
-        records.append(
-            _prepare_one(
+    if workers == 1:
+        for index, item in enumerate(samples, start=1):
+            model_id = str(item["model_id"])
+            split = str(item["split"])
+            print(
+                f"[{index}/{expected_count}] preparing formal GT renders for {model_id}",
+                flush=True,
+            )
+            records.append(
+                _prepare_one(
+                    item,
+                    split,
+                    refinement_root,
+                    output_root,
+                    deps,
+                    backend=backend,
+                    force=force,
+                    dataset_name=dataset_name,
+                )
+            )
+    else:
+        payloads = [
+            (
+                index,
+                expected_count,
                 item,
-                split,
+                str(item["split"]),
                 refinement_root,
                 output_root,
-                deps,
-                backend=backend,
-                force=force,
+                backend,
+                force,
+                dataset_name,
             )
-        )
+            for index, item in enumerate(samples, start=1)
+        ]
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+            initializer=_initialize_render_worker,
+            initargs=(downstream_root,),
+        ) as pool:
+            records.extend(pool.map(_prepare_one_worker, payloads))
     geometry_hashes_after = _geometry_hashes(samples)
     if geometry_hashes_before != geometry_hashes_after:
         raise RuntimeError("A GT or expanded geometry file changed during rendering.")
@@ -87,9 +122,9 @@ def prepare_multiview_dataset(
         role="gt_query_training",
         prepared_key="gt_prepared_path",
         format_version=(
-            "sofa50_gt_query_trial_manifest_v1"
+            f"{dataset_name}_gt_query_trial_manifest_v1"
             if expected_count == 2
-            else "sofa50_gt_query_manifest_v1"
+            else f"{dataset_name}_gt_query_manifest_v1"
         ),
         training_eligible=True,
     )
@@ -99,9 +134,9 @@ def prepare_multiview_dataset(
         role="expanded_raw_frozen_model_inference",
         prepared_key="expanded_prepared_path",
         format_version=(
-            "sofa50_expanded_inference_trial_manifest_v1"
+            f"{dataset_name}_expanded_inference_trial_manifest_v1"
             if expected_count == 2
-            else "sofa50_expanded_inference_manifest_v1"
+            else f"{dataset_name}_expanded_inference_manifest_v1"
         ),
         training_eligible=False,
     )
@@ -111,11 +146,16 @@ def prepare_multiview_dataset(
     _write_json(expanded_manifest_path, expanded_manifest)
 
     loader_audit = _validate_downstream_loaders(
-        gt_manifest_path, expanded_manifest_path, downstream_root, deps
+        gt_manifest_path,
+        expanded_manifest_path,
+        downstream_root,
+        deps,
+        full_forward_validation=full_forward_validation,
     )
     audit = {
         "status": "passed",
-        "scope": "two_sample_trial" if expected_count == 2 else "full_sofa50",
+        "dataset_name": dataset_name,
+        "scope": "two_sample_trial" if expected_count == 2 else f"full_{dataset_name}",
         "sample_count": expected_count,
         "source_refinement_manifest": str(source_manifest_path),
         "downstream_repository": str(downstream_root),
@@ -129,8 +169,9 @@ def prepare_multiview_dataset(
     audit_path = output_root / "FIELD_SHAPE_AUDIT.json"
     _write_json(audit_path, audit)
     observations_manifest = {
-        "format_version": "sofa50_multiview_observations_v1",
-        "scope": "two_sample_trial" if expected_count == 2 else "full_sofa50",
+        "format_version": f"{dataset_name}_multiview_observations_v1",
+        "dataset_name": dataset_name,
+        "scope": "two_sample_trial" if expected_count == 2 else f"full_{dataset_name}",
         "render_source": "gt_mesh.obj",
         "geometry_modified": False,
         "render_spec": RENDER_SPEC,
@@ -152,10 +193,45 @@ def prepare_multiview_dataset(
         "expanded_inference_manifest": str(expanded_manifest_path),
         "field_shape_audit": str(audit_path),
         "report": str(report_path),
-        "full_50_completed": expected_count == 50,
+        "completed": True,
     }
     print(json.dumps(result, indent=2), flush=True)
     return result
+
+
+def _initialize_render_worker(downstream_root: Path) -> None:
+    global _WORKER_DEPS
+    _WORKER_DEPS = _downstream_dependencies(downstream_root)
+
+
+def _prepare_one_worker(payload: tuple[Any, ...]) -> dict[str, Any]:
+    if _WORKER_DEPS is None:
+        raise RuntimeError("render worker dependencies were not initialized")
+    (
+        index,
+        expected_count,
+        item,
+        split,
+        refinement_root,
+        output_root,
+        backend,
+        force,
+        dataset_name,
+    ) = payload
+    print(
+        f"[{index}/{expected_count}] preparing formal GT renders for {item['model_id']}",
+        flush=True,
+    )
+    return _prepare_one(
+        item,
+        split,
+        refinement_root,
+        output_root,
+        _WORKER_DEPS,
+        backend=backend,
+        force=force,
+        dataset_name=dataset_name,
+    )
 
 
 def _prepare_one(
@@ -167,6 +243,7 @@ def _prepare_one(
     *,
     backend: str,
     force: bool,
+    dataset_name: str,
 ) -> dict[str, Any]:
     model_id = str(item["model_id"])
     model_dir = refinement_root / "models" / model_id
@@ -250,7 +327,7 @@ def _prepare_one(
             image_size=RENDER_SPEC["image_size"],
             target_mode="edge_scale_normalized_laplacian",
             extra_metadata={
-                "dataset_family": "sofa50",
+                "dataset_family": dataset_name,
                 "source_sample_id": model_id,
                 "source_split": split,
                 "render_geometry_role": "gt_mesh",
@@ -286,6 +363,7 @@ def _prepare_one(
             gt_path,
             visibility_path,
             deps,
+            dataset_name,
         )
         deps["save_prepared_sample"](expanded_sample, expanded_prepared_path)
 
@@ -314,6 +392,7 @@ def _expanded_inference_sample(
     gt_path: Path,
     visibility_path: Path,
     deps: dict[str, Any],
+    dataset_name: str,
 ) -> dict[str, Any]:
     vertices = torch.as_tensor(expanded_mesh.vertices, dtype=torch.float32)
     faces = torch.as_tensor(expanded_mesh.faces, dtype=torch.long)
@@ -349,7 +428,7 @@ def _expanded_inference_sample(
         "position_normalization_center": center,
         "position_normalization_scale": scale,
         "metadata": {
-            "dataset_family": "sofa50",
+            "dataset_family": dataset_name,
             "source_sample_id": model_id,
             "source_split": split,
             "usage_role": "frozen_model_inference_and_reconstruction_evaluation_only",
@@ -525,6 +604,8 @@ def _validate_downstream_loaders(
     expanded_manifest_path: Path,
     downstream_root: Path,
     deps: dict[str, Any],
+    *,
+    full_forward_validation: bool,
 ) -> dict[str, Any]:
     config = _read_json(
         downstream_root / "configs" / "learned_laplacian" / "train_gt_query_50_960.json"
@@ -539,6 +620,12 @@ def _validate_downstream_loaders(
         for split in ("train", "validation", "test")
         if any(item["split"] == split for item in manifest_items)
     ]
+    forward_indices: set[tuple[str, int]] = set()
+    if not full_forward_validation:
+        for split in present_splits:
+            split_count = sum(item["split"] == split for item in manifest_items)
+            if split_count:
+                forward_indices.add((split, 0))
     for split in present_splits:
         gt_dataset = deps["PreparedMeshDataset"].from_manifest(gt_manifest_path, split)
         expanded_dataset = deps["PreparedMeshDataset"].from_manifest(
@@ -554,19 +641,24 @@ def _validate_downstream_loaders(
             gt_prepared = deps["prepare_object_static"](
                 gt_static, config, keep_image_payload=True, keep_projection=True
             )
-            gt_loaded = deps["prepare_item_for_use"](
-                gt_prepared,
-                config,
-                torch.device("cpu"),
-                cache_on_device=False,
-                decode_images=True,
-            )
-            gt_image_shape = list(gt_loaded.sample["images"].shape)
-            if tuple(gt_image_shape) != (14, 3, 960, 960):
-                raise ValueError(f"{model_id}: GT training loader image tensor shape mismatch")
+            run_forward = full_forward_validation or (split, index) in forward_indices
+            gt_image_shape = [14, 3, 960, 960]
+            if run_forward:
+                gt_loaded = deps["prepare_item_for_use"](
+                    gt_prepared,
+                    config,
+                    torch.device("cpu"),
+                    cache_on_device=False,
+                    decode_images=True,
+                )
+                gt_image_shape = list(gt_loaded.sample["images"].shape)
+                if tuple(gt_image_shape) != (14, 3, 960, 960):
+                    raise ValueError(f"{model_id}: GT training loader image tensor shape mismatch")
             gt_vertices_shape = list(gt_static["vertices"].shape)
             gt_faces_shape = list(gt_static["faces"].shape)
-            del gt_loaded, gt_prepared
+            if run_forward:
+                del gt_loaded
+            del gt_prepared
             gc.collect()
 
             expanded_static = expanded_dataset.load_static(index)
@@ -578,22 +670,26 @@ def _validate_downstream_loaders(
                 keep_image_payload=True,
                 keep_projection=True,
             )
-            expanded_loaded = deps["prepare_item_for_use"](
-                expanded_prepared,
-                inference_config,
-                torch.device("cpu"),
-                cache_on_device=False,
-                decode_images=True,
-            )
-            expanded_image_shape = list(expanded_loaded.sample["images"].shape)
-            if tuple(expanded_image_shape) != (14, 3, 960, 960):
-                raise ValueError(f"{model_id}: expanded inference loader image shape mismatch")
-            with torch.no_grad():
-                prediction = model(expanded_loaded.sample).predicted_laplacian
-            if tuple(prediction.shape) != tuple(expanded_static["vertices"].shape):
-                raise ValueError(f"{model_id}: expanded inference prediction shape mismatch")
-            if not torch.isfinite(prediction).all():
-                raise ValueError(f"{model_id}: expanded inference produced non-finite output")
+            expanded_image_shape = [14, 3, 960, 960]
+            prediction_shape = list(expanded_static["vertices"].shape)
+            if run_forward:
+                expanded_loaded = deps["prepare_item_for_use"](
+                    expanded_prepared,
+                    inference_config,
+                    torch.device("cpu"),
+                    cache_on_device=False,
+                    decode_images=True,
+                )
+                expanded_image_shape = list(expanded_loaded.sample["images"].shape)
+                if tuple(expanded_image_shape) != (14, 3, 960, 960):
+                    raise ValueError(f"{model_id}: expanded inference loader image shape mismatch")
+                with torch.no_grad():
+                    prediction = model(expanded_loaded.sample).predicted_laplacian
+                prediction_shape = list(prediction.shape)
+                if tuple(prediction.shape) != tuple(expanded_static["vertices"].shape):
+                    raise ValueError(f"{model_id}: expanded inference prediction shape mismatch")
+                if not torch.isfinite(prediction).all():
+                    raise ValueError(f"{model_id}: expanded inference produced non-finite output")
             records.append(
                 {
                     "model_id": model_id,
@@ -607,11 +703,13 @@ def _validate_downstream_loaders(
                     "expanded_inference_decoded_images_shape": expanded_image_shape,
                     "expanded_vertices_shape": list(expanded_static["vertices"].shape),
                     "expanded_faces_shape": list(expanded_static["faces"].shape),
-                    "expanded_zero_image_model_forward": "passed",
-                    "prediction_shape": list(prediction.shape),
+                    "expanded_zero_image_model_forward": "passed" if run_forward else "not_sampled",
+                    "prediction_shape": prediction_shape,
                 }
             )
-            del expanded_loaded, expanded_prepared, prediction
+            if run_forward:
+                del expanded_loaded, prediction
+            del expanded_prepared
             gc.collect()
     return {
         "status": "passed",
@@ -626,6 +724,7 @@ def _validate_downstream_loaders(
             "PreparedMeshDataset + actual multi_trainer preparation with query_training disabled"
         ),
         "expanded_forward_check": "untrained architecture, zero RGB features; interface/shape only",
+        "full_forward_validation": full_forward_validation,
         "records": records,
     }
 
@@ -751,9 +850,9 @@ def _git_branch(root: Path) -> str:
 def _report(audit: dict[str, Any], observations_path: Path) -> str:
     sample_count = int(audit["sample_count"])
     lines = [
-        f"# Sofa50 final {'trial' if sample_count == 2 else 'full'} multiview audit",
+        f"# {audit['dataset_name']} {'trial' if sample_count == 2 else 'full'} multiview audit",
         "",
-        f"Status: **passed** for {sample_count} Sofa50 samples.",
+        f"Status: **passed** for {sample_count} samples.",
         "",
         f"- Observations manifest: `{observations_path}`",
         f"- Downstream repository: `{audit['downstream_repository']}` on `{audit['downstream_git_branch']}`",
