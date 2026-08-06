@@ -20,4 +20,4 @@ dependencies:
   - mkl<2025
   - pip:
       - thingi10k>=0.0.7
-      - fast-simplification>=0.1.8
+      - fast-simplification>=0.1.13

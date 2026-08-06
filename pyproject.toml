@@ -18,6 +18,7 @@ dependencies = [
   "tqdm>=4.66",
   "matplotlib>=3.8",
   "Pillow>=10",
+  "fast-simplification>=0.1.13",
 ]
 
 [project.scripts]
