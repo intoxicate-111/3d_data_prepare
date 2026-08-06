@@ -1,27 +1,26 @@
 seed: 20260804
 
 cache_dir: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/thingi10k50/data/.cache/thingi10k"
-output_root: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/thingi10k5000/sample_5000"
+output_root: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/thingi10k50/sample_50_960"
 
 log_file: "prepare.log"
 force: false
 
-max_faces: 20000000
-min_vertices: 100
-min_faces: 200
+max_faces: 200000
+min_vertices: 1000
+min_faces: 2000
 
 known_corrupt_ids: [49911, 74463, 286163, 81313, 77942]
 
 strata:
-  - name: "all"
-    min_faces: 200
-    max_faces: 20000000
-    count: 5000
+  - {name: "low", min_faces: 2000, max_faces: 20000, count: 15}
+  - {name: "mid", min_faces: 20000, max_faces: 60000, count: 20}
+  - {name: "high", min_faces: 60000, max_faces: 200000, count: 15}
 
 split:
-  train: 4000
-  val: 500
-  test: 500
+  train: 40
+  val: 5
+  test: 5
 
 normalization:
   mode: "unit_sphere_max_radius"
@@ -36,8 +35,8 @@ subdivision:
 
 views:
   count: 14
-  width: 1920
-  height: 1920
+  width: 960
+  height: 960
   trajectory: "cube_surface"
   backend: "opengl"
   opengl_context_backend: "egl"
@@ -54,7 +53,7 @@ downstream:
 prepared_samples:
   directory: "prepared"
   manifest: "prepared_manifest.json"
-  image_size: 1920
+  image_size: 960
   target_mode: "edge_scale_normalized_laplacian"
   edge_scale_epsilon: 1.0e-12
   storage_format: "lazy_image_paths_v1"

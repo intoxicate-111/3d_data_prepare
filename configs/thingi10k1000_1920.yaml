@@ -49,7 +49,7 @@ views:
 downstream:
   repo_url: "https://github.com/intoxicate-111/multiview-laplacian-refinement.git"
   repo_root: "/home/zhou_c_WMGDS.WMG.WARWICK.AC.UK/multiview-laplacian-refinement"
-  branch: "fix/clean-bunny-normalized-laplacian"
+  branch: "main"
 
 prepared_samples:
   directory: "prepared"
